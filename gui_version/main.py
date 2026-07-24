@@ -194,9 +194,12 @@ class ExtractorGUI:
         filenames = filedialog.askopenfilenames(
             title="Choose Qualcomm modem images or RF MBNs",
             filetypes=(
-                ("Modem images and MBNs", "*.img *.bin *.mbn"),
+                (
+                    "Modem images, archives, and MBNs",
+                    "*.img *.bin *.mbn *.gz *.xz *.zst *.zip *.tar *.tgz *.7z",
+                ),
                 ("MBN files", "*.mbn"),
-                ("Modem images", "*.img *.bin"),
+                ("Modem images and archives", "*.img *.bin *.gz *.xz *.zst *.zip *.tar *.tgz *.7z"),
                 ("All files", "*.*"),
             ),
         )

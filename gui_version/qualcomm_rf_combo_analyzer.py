@@ -18,13 +18,15 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import logging
 import re
 import struct
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Sequence
 
+import image_extractor
 import legacy_rf_parser as legacy
 import new_rfcard_parser as modern
 
@@ -62,6 +64,7 @@ class ModuleRecord:
     bid: int
     external: bool = False
     source_path: str = ""
+    sidecars: dict[str, str] = field(default_factory=dict)
 
     @property
     def identity(self) -> str:
@@ -128,10 +131,15 @@ def scan_source(path: Path) -> list[ModuleRecord]:
     try:
         fat = legacy.Fat16Image(path)
     except Exception as exc:
-        raise ToolError(
-            "Input is neither a named RF MBN nor a supported FAT16 modem image: "
-            f"{exc}"
-        ) from exc
+        # Not a FAT16 image: try the universal container extractor.
+        try:
+            result = image_extractor.scan_container(path)
+        except Exception as extract_exc:
+            raise ToolError(
+                "Input is neither a named RF MBN nor a supported FAT16 modem image; "
+                f"container extraction also failed: {extract_exc}"
+            ) from extract_exc
+        return _records_from_extraction(result)
 
     records: list[ModuleRecord] = []
     for inner_path, entry in _walk_fat(fat):
@@ -155,6 +163,55 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                 source_path=str(path.resolve()),
             )
         )
+    return _sort_records(records)
+
+
+def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleRecord]:
+    """Convert extracted MBN paths into ``ModuleRecord`` objects.
+
+    Sidecars discovered in the same directory as an MBN are attached to that
+    record so the GUI can optionally surface them.
+    """
+    records: list[ModuleRecord] = []
+    scratch = result.scratch_dir
+    for mbn_path in result.mbns:
+        match_info = _matches_candidate(mbn_path.name)
+        if not match_info:
+            continue
+        generation, match = match_info
+        inner_rel = (
+            str(mbn_path.relative_to(scratch))
+            if scratch in mbn_path.parents
+            else mbn_path.name
+        )
+        # Preserve the legacy ELF /so/ filter for extracted ELF MBNs.
+        if generation == "Legacy ELF" and "/so/" not in inner_rel.casefold():
+            continue
+        sidecars = image_extractor.sidecars_in_directory(mbn_path.parent, result.sidecars)
+        if sidecars:
+            logging.getLogger(__name__).info(
+                "Discovered sidecars for %s: %s",
+                mbn_path.name,
+                ", ".join(sorted(sidecars)),
+            )
+        records.append(
+            ModuleRecord(
+                inner_path=inner_rel,
+                name=mbn_path.name,
+                generation=generation,
+                size=mbn_path.stat().st_size,
+                hwid=int(match.group("hwid")),
+                fsid=int(match.group("fsid")),
+                bid=int(match.group("bid")),
+                external=True,
+                source_path=str(mbn_path.resolve()),
+                sidecars=sidecars,
+            )
+        )
+    return _sort_records(records)
+
+
+def _sort_records(records: list[ModuleRecord]) -> list[ModuleRecord]:
     return sorted(
         records,
         key=lambda item: (
