@@ -121,6 +121,90 @@ def _read_magic(path: Path, n: int = MAGIC_MAX) -> bytes:
         return b""
 
 
+def _slice_file(src: Path, dst: Path, offset: int, chunk_size: int = 1 << 20) -> None:
+    """Copy ``src`` from ``offset`` to end into ``dst``."""
+    with src.open("rb") as handle:
+        handle.seek(offset)
+        with dst.open("wb") as out:
+            while True:
+                chunk = handle.read(chunk_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+
+
+# Android sparse image magic and header validation.
+_SPARSE_MAGIC = struct.unpack("<I", b"\x3a\xff\x26\xed")[0]
+
+
+def _sparse_headers(path: Path, max_offsets: int = 8) -> list[int]:
+    """Return up to ``max_offsets`` sparse-image start offsets in ``path``.
+
+    Some OEM firmware images wrap a sparse/ext4 payload in a proprietary
+    header (e.g. Motorola ``SINGLE_N_LONELY``).  Scanning for valid sparse
+    headers lets us find and extract the real filesystem even when the first
+    bytes of the file are not a known container.
+    """
+    offsets: list[int] = []
+    size = path.stat().st_size
+    if size < 28:
+        return offsets
+    # Read in chunks so we do not load huge firmware images into memory.
+    chunk_size = 1 << 20
+    overlap = 28
+    with path.open("rb") as handle:
+        pos = 0
+        while pos < size and len(offsets) < max_offsets:
+            read_size = min(chunk_size, size - pos)
+            data = handle.read(read_size)
+            if not data:
+                break
+            start = 0
+            while True:
+                idx = data.find(b"\x3a\xff\x26\xed", start)
+                if idx < 0:
+                    break
+                offset = pos + idx
+                if offset + 28 <= size:
+                    try:
+                        header = struct.unpack(
+                            "<IHHHHIIII",
+                            _read_at(handle, offset, 28),
+                        )
+                    except (struct.error, OSError):
+                        header = ()
+                    (
+                        magic,
+                        major,
+                        minor,
+                        file_hdr_sz,
+                        chunk_hdr_sz,
+                        block_size,
+                        total_blocks,
+                        total_chunks,
+                        _image_checksum,
+                    ) = header
+                    if (
+                        magic == _SPARSE_MAGIC
+                        and major == 1
+                        and minor == 0
+                        and file_hdr_sz == 28
+                        and chunk_hdr_sz == 12
+                        and block_size in (512, 1024, 2048, 4096, 8192, 16384, 32768)
+                        and total_blocks > 0
+                        and total_chunks > 0
+                    ):
+                        offsets.append(offset)
+                start = idx + 1
+            pos += read_size - overlap if read_size == chunk_size else read_size
+    return offsets
+
+
+def _read_at(handle, offset: int, n: int) -> bytes:
+    handle.seek(offset)
+    return handle.read(n)
+
+
 # ---------------------------------------------------------------------------
 # Detection
 # ---------------------------------------------------------------------------
@@ -190,14 +274,33 @@ def detect(path: Path) -> str:
 
 
 def extract_sparse(path: Path, ctx: ExtractContext) -> Path | None:
-    if not ctx.tools.check("simg2img"):
-        return None
-    out = _new_workdir(ctx, "sparse") / (path.stem + ".raw")
-    res = _run(["simg2img", str(path), str(out)])
-    if res.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+    """Convert a sparse image to a raw ext4 image, or extract it directly.
+
+    ``simg2img`` is preferred because it yields a raw image we can chain into
+    the ext4 extractor.  If it is missing or fails, fall back to ``7z`` which
+    can read Android sparse images directly and extract the filesystem tree.
+    """
+    if _have("simg2img"):
+        out = _new_workdir(ctx, "sparse") / (path.stem + ".raw")
+        res = _run(["simg2img", str(path), str(out)])
+        if res.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            return out
         logger.warning("simg2img failed on %s: %s", path, _stderr(res))
-        return None
-    return out
+
+    if _have("7z"):
+        # 7z understands sparse images and returns the extracted files.
+        out = _new_workdir(ctx, "sparse")
+        res = _run(["7z", "x", "-y", f"-o{out}", str(path)])
+        if res.returncode == 0 or any(out.rglob("*")):
+            return out
+        logger.warning("7z sparse extraction failed on %s: %s", path, _stderr(res))
+
+    # Trigger the standard missing-tool warning only when neither helper is
+    # installed.  If a helper is installed but failed, that was already logged.
+    if not _have("simg2img") and not _have("7z"):
+        ctx.tools.check("simg2img")
+        logger.warning("No sparse image extractor available for %s", path.name)
+    return None
 
 
 def extract_ext4(path: Path, ctx: ExtractContext) -> Path | None:
@@ -398,6 +501,11 @@ def unwrap(path: Path, ctx: ExtractContext, depth: int = 0) -> None:
     logger.info("detect: %s -> %s", path, tag)
 
     if tag in ("empty", "unknown", "bootimg"):
+        # For unrecognized top-level images, scan for known containers that are
+        # hidden behind OEM wrappers (e.g. Motorola ``SINGLE_N_LONELY`` packages
+        # where the real sparse image starts several KB into the file).
+        if tag == "unknown" and depth == 0:
+            _unwrap_embedded_containers(path, ctx, depth)
         return
 
     extractor = EXTRACTORS.get(tag)
@@ -423,6 +531,25 @@ def _maybe_unwrap_child(path: Path, ctx: ExtractContext, depth: int) -> None:
     tag = detect(path)
     if tag in EXTRACTORS:
         unwrap(path, ctx, depth)
+
+
+def _unwrap_embedded_containers(path: Path, ctx: ExtractContext, depth: int) -> None:
+    """Look for known containers embedded at arbitrary offsets inside ``path``.
+
+    OEM update packages sometimes prepend a header/table before the actual
+    sparse, ext4, or archive payload.  We scan for a small set of reliable
+    signatures and slice each match out into its own temporary file so the
+    normal recursive pipeline can process it.
+    """
+    logger.info("scanning %s for embedded containers", path)
+
+    # Android sparse images are the most common wrapped payload in Qualcomm
+    # modem firmware (radio.img/non-hlos.bin style packages).
+    for offset in _sparse_headers(path):
+        logger.info("found sparse image at offset %d in %s", offset, path)
+        sliced = _new_workdir(ctx, "sliced") / (path.stem + ".sparse")
+        _slice_file(path, sliced, offset)
+        unwrap(sliced, ctx, depth + 1)
 
 
 # ---------------------------------------------------------------------------
