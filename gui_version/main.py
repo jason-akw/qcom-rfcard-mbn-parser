@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""Tkinter and command-line front end for the Qualcomm RF analyzer.
-
-The parsing, extraction, export, and MBN-comparison implementation lives in
-``qualcomm_rf_combo_analyzer.py``. Run this file without arguments for the GUI,
-or pass a source path to use the command-line interface.
-"""
-
 from __future__ import annotations
 
 import argparse
