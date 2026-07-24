@@ -9,7 +9,7 @@ import json
 import sys
 from pathlib import Path
 
-import recover_rfcard_combos as rfcard
+import new_rfcard_parser as rfcard
 
 
 def inspect_mbn(path: Path) -> dict[str, object]:
