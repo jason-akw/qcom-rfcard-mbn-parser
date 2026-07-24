@@ -32,7 +32,7 @@ import new_rfcard_parser as modern
 # the legacy implementation directly.
 ParseError = legacy.ParseError
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 MODERN_RE = re.compile(
     r"^rf_config_(?P<hwid>\d+)_(?P<fsid>\d+)_(?P<bid>\d+)\.mbn$",
     re.IGNORECASE,
@@ -1057,7 +1057,7 @@ def export_many(
         progress(f"Wrote {summary_path}")
     return summaries
 
-
+####################
 _COMPARE_PROPERTY_FIELDS = (
     "power_class",
     "bcs_num",
@@ -1087,56 +1087,98 @@ def _split_bw_mimo(side: str | None) -> tuple[list[str], list[str]]:
     """Convert '100x4,100x4' into (['100', '100'], ['4', '4'])."""
     bandwidths: list[str] = []
     mimo: list[str] = []
+
     if not side:
         return bandwidths, mimo
+
     for part in side.split(","):
         part = part.strip()
         if not part:
             continue
+
         if "x" in part:
-            bw, layers = part.rsplit("x", 1)
-            bandwidths.append(bw)
+            bandwidth, layers = part.rsplit("x", 1)
+            bandwidths.append(bandwidth)
             mimo.append(layers)
         else:
             bandwidths.append(part)
             mimo.append("?")
+
     return bandwidths, mimo
+
+
+_COMBO_TOKEN_RE = re.compile(
+    r"^(?P<rat>[BN])(?P<band>\d+)"
+    r"(?P<dl_class>_|[A-Z]|X\d+)"
+    r"(?:\[(?P<dl_side>[^\]]*)\])?"
+    r"(?:;(?P<ul_class>[A-Z]|X\d+)\[(?P<ul_side>[^\]]*)\])?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_combo_expression(
+    expression: Any,
+) -> tuple[dict[str, Any], ...] | None:
+    """Parse a recovered combo expression into comparable components."""
+    if not isinstance(expression, str) or not expression:
+        return None
+
+    components: list[dict[str, Any]] = []
+
+    for raw_token in expression.split("+"):
+        match = _COMBO_TOKEN_RE.fullmatch(raw_token.strip())
+        if match is None:
+            return None
+
+        dl_bw, dl_mimo = _split_bw_mimo(match.group("dl_side"))
+        ul_bw, ul_mimo = _split_bw_mimo(match.group("ul_side"))
+
+        components.append(
+            {
+                "rat": match.group("rat").upper(),
+                "band": int(match.group("band")),
+                "dl_class": match.group("dl_class").upper(),
+                "dl_bw": tuple(dl_bw),
+                "dl_mimo": tuple(dl_mimo),
+                "ul_class": (
+                    match.group("ul_class").upper()
+                    if match.group("ul_class")
+                    else None
+                ),
+                "ul_bw": tuple(ul_bw),
+                "ul_mimo": tuple(ul_mimo),
+            }
+        )
+
+    return tuple(components)
 
 
 def _compact_combo_expression(expression: Any) -> str:
     """Render a recovered RFCard expression as a compact QCAT-like row."""
-    if not isinstance(expression, str) or not expression:
+    components = _parse_combo_expression(expression)
+    if components is None:
         return str(expression)
-
-    token_re = re.compile(
-        r"^(?P<rat>[BN])(?P<band>\d+)"
-        r"(?P<dl_class>_|[A-Z]|X\d+)"
-        r"(?:\[(?P<dl_side>[^\]]*)\])?"
-        r"(?:;(?P<ul_class>[A-Z]|X\d+)\[(?P<ul_side>[^\]]*)\])?$",
-        re.IGNORECASE,
-    )
 
     dl_bands: list[str] = []
     dl_mimo: list[str] = []
     dl_bw: list[str] = []
     ul_bands: list[str] = []
 
-    for token in expression.split("+"):
-        match = token_re.fullmatch(token.strip())
-        if match is None:
-            return expression
+    for component in components:
+        dl_bands.append(
+            _format_component_band(
+                component["rat"],
+                str(component["band"]),
+                component["dl_class"],
+            )
+        )
 
-        rat = match.group("rat")
-        band = match.group("band")
-        dl_class = match.group("dl_class").upper()
-        dl_bands.append(_format_component_band(rat, band, dl_class))
+        dl_bw.extend(component["dl_bw"] or ("?",))
+        dl_mimo.extend(component["dl_mimo"] or ("?",))
 
-        bandwidths, mimo = _split_bw_mimo(match.group("dl_side"))
-        dl_bw.extend(bandwidths or ["?"])
-        dl_mimo.extend(mimo or ["?"])
-
-        if match.group("ul_class"):
-            ul_bands.append(("n" if rat.upper() == "N" else "B") + band)
+        if component["ul_class"]:
+            rat_prefix = "n" if component["rat"] == "N" else "B"
+            ul_bands.append(rat_prefix + str(component["band"]))
 
     return (
         f"DL: {'+'.join(dl_bands)}"
@@ -1155,16 +1197,143 @@ def _format_combo_signature(signature: tuple[Any, ...]) -> str:
         "ul_tx_switch_type": "swul",
         "higher_power_limit": "hpl",
     }
-    attrs = []
+
+    attrs: list[str] = []
+
     for field, value in zip(_COMPARE_PROPERTY_FIELDS, properties):
         if value is None:
             continue
+
         if field == "higher_power_limit" and value is False:
             continue
+
         attrs.append(f"{property_labels[field]}={value}")
 
     base = _compact_combo_expression(expression)
-    return base + (f" | {', '.join(attrs)}" if attrs else "")
+
+    if attrs:
+        return f"{base} | {', '.join(attrs)}"
+
+    return base
+
+
+def _signature_topology(
+    signature: tuple[Any, ...],
+) -> tuple[Any, ...] | None:
+    """Return combo identity while ignoring BW, MIMO and properties.
+
+    The table, RAT/band order, DL class and UL arrangement remain part of the
+    identity. For example, n12A+n48A remains the same underlying combo when
+    only its bandwidth or MIMO arrangement changes.
+    """
+    table, _sub_capability, expression, *_properties = signature
+    components = _parse_combo_expression(expression)
+
+    if components is None:
+        return None
+
+    return (
+        table,
+        tuple(
+            (
+                component["rat"],
+                component["band"],
+                component["dl_class"],
+                component["ul_class"],
+            )
+            for component in components
+        ),
+    )
+
+
+def _signature_bw(
+    signature: tuple[Any, ...],
+) -> tuple[Any, ...] | None:
+    components = _parse_combo_expression(signature[2])
+
+    if components is None:
+        return None
+
+    return tuple(
+        (
+            component["dl_bw"],
+            component["ul_bw"],
+        )
+        for component in components
+    )
+
+
+def _signature_mimo(
+    signature: tuple[Any, ...],
+) -> tuple[Any, ...] | None:
+    components = _parse_combo_expression(signature[2])
+
+    if components is None:
+        return None
+
+    return tuple(
+        (
+            component["dl_mimo"],
+            component["ul_mimo"],
+        )
+        for component in components
+    )
+
+
+def _signature_properties(
+    signature: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    """Return sub-capability and combo-level property values."""
+    return (
+        signature[1],
+        *signature[3:],
+    )
+
+
+def _variant_note(
+    removed: tuple[Any, ...],
+    current_values: set[tuple[Any, ...]],
+) -> str:
+    removed_topology = _signature_topology(removed)
+
+    if removed_topology is None:
+        return "Combo completely gone"
+
+    candidates = [
+        candidate
+        for candidate in current_values
+        if _signature_topology(candidate) == removed_topology
+    ]
+
+    if not candidates:
+        return "Combo completely gone"
+
+    removed_bw = _signature_bw(removed)
+    removed_mimo = _signature_mimo(removed)
+
+    notes: list[tuple[int, str]] = []
+
+    for candidate in candidates:
+        bw_changed = _signature_bw(candidate) != removed_bw
+        mimo_changed = _signature_mimo(candidate) != removed_mimo
+
+        if bw_changed and mimo_changed:
+            note = "BW and MIMO changed"
+            score = 2
+        elif bw_changed:
+            note = "BW changed"
+            score = 1
+        elif mimo_changed:
+            note = "MIMO changed"
+            score = 1
+        else:
+            note = "Combo still exists"
+            score = 0
+
+        notes.append((score, note))
+
+    notes.sort(key=lambda item: (item[0], item[1]))
+    return notes[0][1]
 
 
 def _band_set(
@@ -1192,29 +1361,54 @@ def _table_signatures(
     }
 
 
-def _raw_table_count(parsed: dict[str, Any], tables: set[str]) -> int:
+def _raw_table_count(
+    parsed: dict[str, Any],
+    tables: set[str],
+) -> int:
     return sum(
-        1 for combo in parsed["combinations"] if combo.get("table") in tables
+        1
+        for combo in parsed["combinations"]
+        if combo.get("table") in tables
     )
 
 
 def _format_bands(bands: set[int], prefix: str) -> str:
-    return ", ".join(f"{prefix}{band}" for band in sorted(bands)) or "(none)"
+    return (
+        ", ".join(
+            f"{prefix}{band}"
+            for band in sorted(bands)
+        )
+        or "(none)"
+    )
 
 
 def _append_difference_list(
     lines: list[str],
     title: str,
     values: set[tuple[Any, ...]],
+    *,
+    current_values: set[tuple[Any, ...]] | None = None,
 ) -> None:
     lines.append(f"{title}: {len(values)}")
-    if values:
-        for value in sorted(values, key=lambda item: _format_combo_signature(item).casefold()):
-            lines.append(f"  {_format_combo_signature(value)}")
-    else:
+
+    if not values:
         lines.append("  (none)")
+        return
 
+    ordered_values = sorted(
+        values,
+        key=lambda item: _format_combo_signature(item).casefold(),
+    )
 
+    for value in ordered_values:
+        text = _format_combo_signature(value)
+
+        if current_values is not None:
+            note = _variant_note(value, current_values)
+            text += f" ({note})"
+
+        lines.append(f"  {text}")
+#######################
 def _identical_groups(
     analyses: Sequence[tuple[ModuleRecord, dict[str, Any]]],
     tables: set[str],
@@ -1347,7 +1541,10 @@ def write_comparison_reports(
             ]
         )
         _append_difference_list(
-            lte_lines, "LTE combos added", combos - ref_lte_combos
+            lte_lines,
+            "LTE combos removed",
+            ref_lte_combos - combos,
+            current_values=combos,
         )
         _append_difference_list(
             lte_lines, "LTE combos removed", ref_lte_combos - combos
@@ -1410,8 +1607,9 @@ def write_comparison_reports(
             )
             _append_difference_list(
                 nr_lines,
-                f"{TABLE_DISPLAY[table]} combos added",
-                current - reference,
+                f"{TABLE_DISPLAY[table]} combos removed",
+                reference - current,
+                current_values=current,
             )
             _append_difference_list(
                 nr_lines,

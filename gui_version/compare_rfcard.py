@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Compare modern Qualcomm RFCard MBN capability tables.
 
 The script recursively scans rf_config_*.mbn files, decodes them through
@@ -103,6 +102,142 @@ def combo_sort_key(signature: ComboSignature) -> tuple[object, ...]:
         natural_key(signature.expression),
         signature.attributes,
     )
+
+
+_COMBO_TOKEN_RE = re.compile(
+    r"^(?P<rat>[BN])(?P<band>\d+)"
+    r"(?P<dl_class>_|[A-Z]|X\d+)"
+    r"(?:\[(?P<dl_side>[^\]]*)\])?"
+    r"(?:;(?P<ul_class>[A-Z]|X\d+)\[(?P<ul_side>[^\]]*)\])?$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ComboDetails:
+    """Comparison dimensions extracted from one reconstructed combo expression."""
+
+    topology: tuple[tuple[str, int, str, str], ...]
+    bandwidth: tuple[tuple[str, ...], ...]
+    mimo: tuple[tuple[str, ...], ...]
+
+
+def _split_side(side: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split a side such as ``100x4,100x4`` into BW and MIMO tuples.
+
+    Older LTE expressions can contain a plain antenna enum/index such as
+    ``B3A[3]``.  In that case the value is treated as MIMO/antenna information
+    and no bandwidth value is claimed.
+    """
+    bandwidth: list[str] = []
+    mimo: list[str] = []
+    if not side:
+        return (), ()
+
+    for part in side.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "x" in part:
+            bw, layers = part.rsplit("x", 1)
+            bandwidth.append(bw.strip())
+            mimo.append(layers.strip())
+        else:
+            # Legacy/reconstructed LTE syntax often stores only antenna enum.
+            mimo.append(part)
+    return tuple(bandwidth), tuple(mimo)
+
+
+def combo_details(signature: ComboSignature) -> ComboDetails | None:
+    """Return topology, BW and MIMO dimensions for variant-aware comparison."""
+    topology: list[tuple[str, int, str, str]] = []
+    bandwidth: list[tuple[str, ...]] = []
+    mimo: list[tuple[str, ...]] = []
+
+    for token in signature.expression.split("+"):
+        match = _COMBO_TOKEN_RE.fullmatch(token.strip())
+        if match is None:
+            return None
+
+        rat = match.group("rat").upper()
+        band = int(match.group("band"))
+        dl_class = match.group("dl_class").upper()
+        ul_class = (match.group("ul_class") or "").upper()
+
+        dl_bw, dl_mimo = _split_side(match.group("dl_side"))
+        ul_bw, ul_mimo = _split_side(match.group("ul_side"))
+
+        topology.append((rat, band, dl_class, ul_class))
+        bandwidth.append(dl_bw + ul_bw)
+        mimo.append(dl_mimo + ul_mimo)
+
+    return ComboDetails(
+        topology=tuple(topology),
+        bandwidth=tuple(bandwidth),
+        mimo=tuple(mimo),
+    )
+
+
+def removed_combo_status(
+    removed: ComboSignature,
+    current_signatures: Iterable[ComboSignature],
+) -> str:
+    """Explain whether a removed exact signature survives as another variant."""
+    removed_details = combo_details(removed)
+    if removed_details is None:
+        return "Exact combo removed"
+
+    candidates: list[tuple[tuple[int, int, int, str], str]] = []
+    for current in current_signatures:
+        if current.section != removed.section:
+            continue
+        current_details = combo_details(current)
+        if current_details is None:
+            continue
+        if current_details.topology != removed_details.topology:
+            continue
+
+        bw_changed = current_details.bandwidth != removed_details.bandwidth
+        mimo_changed = current_details.mimo != removed_details.mimo
+        properties_changed = current.attributes != removed.attributes
+
+        if bw_changed and mimo_changed:
+            status = "Combo still exists, BW and MIMO changed"
+        elif bw_changed:
+            status = "Combo still exists, BW changed"
+        elif mimo_changed:
+            status = "Combo still exists, MIMO changed"
+        elif properties_changed:
+            status = "Combo still exists, properties changed"
+        else:
+            # Should normally be impossible because exact signatures were
+            # removed with set subtraction, but keep the function defensive.
+            status = "Combo still exists"
+
+        # Prefer the closest surviving variant when several share a topology.
+        rank = (
+            int(bw_changed) + int(mimo_changed) + int(properties_changed),
+            int(bw_changed) + int(mimo_changed),
+            int(properties_changed),
+            current.expression,
+        )
+        candidates.append((rank, status))
+
+    if not candidates:
+        return "Combo completely gone"
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def format_removed_combo(
+    signature: ComboSignature,
+    current_signatures: Iterable[ComboSignature],
+    *,
+    include_section: bool = False,
+) -> str:
+    base = signature.display(include_section=include_section)
+    return f"{base} ({removed_combo_status(signature, current_signatures)})"
 
 
 def extract_bands(expression: str) -> tuple[set[int], set[int]]:
@@ -300,7 +435,12 @@ def make_lte_report(
             f"  Net unique combo change: {len(added) - len(removed):+d}",
         ])
         add_list(lines, "  LTE combos added", [item.display() for item in added], limit)
-        add_list(lines, "  LTE combos removed", [item.display() for item in removed], limit)
+        add_list(
+            lines,
+            "  LTE combos removed",
+            [format_removed_combo(item, profile.lte_signatures) for item in removed],
+            limit,
+        )
 
     add_failures(lines, failures)
     lines.append("")
@@ -378,7 +518,14 @@ def make_nr_report(
         add_list(
             lines,
             "  NR-related combos removed",
-            [item.display(include_section=True) for item in removed],
+            [
+                format_removed_combo(
+                    item,
+                    profile.nr_signatures,
+                    include_section=True,
+                )
+                for item in removed
+            ],
             limit,
         )
 
