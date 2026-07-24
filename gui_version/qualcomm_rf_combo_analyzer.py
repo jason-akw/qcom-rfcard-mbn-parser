@@ -114,19 +114,22 @@ def scan_source(path: Path) -> list[ModuleRecord]:
     direct = _matches_candidate(path.name)
     if direct:
         generation, match = direct
-        return [
-            ModuleRecord(
-                inner_path=str(path),
-                name=path.name,
-                generation=generation,
-                size=path.stat().st_size,
-                hwid=int(match.group("hwid")),
-                fsid=int(match.group("fsid")),
-                bid=int(match.group("bid")),
-                external=True,
-                source_path=str(path.resolve()),
-            )
-        ]
+        return _deduplicate_records(
+            [
+                ModuleRecord(
+                    inner_path=str(path),
+                    name=path.name,
+                    generation=generation,
+                    size=path.stat().st_size,
+                    hwid=int(match.group("hwid")),
+                    fsid=int(match.group("fsid")),
+                    bid=int(match.group("bid")),
+                    external=True,
+                    source_path=str(path.resolve()),
+                )
+            ],
+            path,
+        )
 
     try:
         fat = legacy.Fat16Image(path)
@@ -139,7 +142,7 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                 "Input is neither a named RF MBN nor a supported FAT16 modem image; "
                 f"container extraction also failed: {extract_exc}"
             ) from extract_exc
-        return _records_from_extraction(result)
+        return _deduplicate_records(_records_from_extraction(result), path)
 
     records: list[ModuleRecord] = []
     for inner_path, entry in _walk_fat(fat):
@@ -163,7 +166,7 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                 source_path=str(path.resolve()),
             )
         )
-    return _sort_records(records)
+    return _deduplicate_records(_sort_records(records), path)
 
 
 def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleRecord]:
@@ -222,6 +225,39 @@ def _sort_records(records: list[ModuleRecord]) -> list[ModuleRecord]:
             item.inner_path.casefold(),
         ),
     )
+
+
+def _deduplicate_records(
+    records: list[ModuleRecord], source: Path | None = None
+) -> list[ModuleRecord]:
+    """Drop duplicate records that share the same filename and SHA-256 hash.
+
+    Some firmware packages contain the same MBN in several extraction paths
+    (e.g. wrapped sparse images that surface identical files under different
+    scratch directory names).  Keeping only the first occurrence prevents the
+    GUI from exporting the same content multiple times.
+    """
+    seen: set[tuple[str, str]] = set()
+    unique: list[ModuleRecord] = []
+    for record in records:
+        try:
+            blob = read_module(source, record) if source else Path(record.source_path).read_bytes()
+        except OSError as exc:
+            logging.getLogger(__name__).warning(
+                "Cannot hash %s for deduplication: %s", record.name, exc
+            )
+            unique.append(record)
+            continue
+        digest = hashlib.sha256(blob).hexdigest()
+        key = (record.name, digest)
+        if key in seen:
+            logging.getLogger(__name__).info(
+                "Skipping duplicate MBN: %s (SHA256 %s)", record.name, digest[:16]
+            )
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique
 
 
 def record_source(record: ModuleRecord, fallback: Path | None = None) -> Path:
