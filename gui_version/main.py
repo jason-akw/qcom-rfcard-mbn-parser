@@ -68,7 +68,7 @@ class ExtractorGUI:
 
         tree_frame = ttk.Frame(outer)
         tree_frame.pack(fill="both", expand=True)
-        columns = ("extract", "generation", "identity", "size", "path")
+        columns = ("extract", "generation", "identity", "size", "lte", "nr", "path")
         self.tree = ttk.Treeview(
             tree_frame, columns=columns, show="headings", selectmode="browse"
         )
@@ -76,16 +76,26 @@ class ExtractorGUI:
             "generation": "Format",
             "identity": "HWID_FSID_BID",
             "size": "Size",
+            "lte": "LTE combos",
+            "nr": "NR combos",
             "path": "Path inside image",
             "extract": "Extract",
         }
-        widths = {"extract": 70, "generation": 120, "identity": 145, "size": 95, "path": 620}
+        widths = {
+            "extract": 70,
+            "generation": 120,
+            "identity": 145,
+            "size": 95,
+            "lte": 90,
+            "nr": 140,
+            "path": 620,
+        }
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(
                 column,
                 width=widths[column],
-                anchor="center" if column in {"extract", "generation", "identity", "size"} else "w",
+                anchor="center" if column in {"extract", "generation", "identity", "size", "lte", "nr"} else "w",
                 stretch=column == "path",
             )
         y_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
@@ -448,6 +458,8 @@ class ExtractorGUI:
                     {"DAT/protobuf": "XML DAT"}.get(record.generation, record.generation),
                     record.identity,
                     f"{record.size / 1024:,.1f} KB",
+                    str(record.lte_combos) if record.lte_combos >= 0 else "—",
+                    record.nr_combos,
                     f"{record.inner_path}"
                     if record.source_path else record.inner_path,
                 ),

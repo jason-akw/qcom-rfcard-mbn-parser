@@ -66,6 +66,8 @@ class ModuleRecord:
     source_path: str = ""
     sidecars: dict[str, str] = field(default_factory=dict)
     sha256: str = ""
+    lte_combos: int = -1
+    nr_combos: str = ""
 
     @property
     def identity(self) -> str:
@@ -115,7 +117,21 @@ def scan_source(path: Path) -> list[ModuleRecord]:
     direct = _matches_candidate(path.name)
     if direct:
         generation, match = direct
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        blob = path.read_bytes()
+        digest = hashlib.sha256(blob).hexdigest()
+        temp_record = ModuleRecord(
+            inner_path=str(path),
+            name=path.name,
+            generation=generation,
+            size=path.stat().st_size,
+            hwid=int(match.group("hwid")),
+            fsid=int(match.group("fsid")),
+            bid=int(match.group("bid")),
+            external=True,
+            source_path=str(path.resolve()),
+            sha256=digest,
+        )
+        lte, nr = _combo_counts(temp_record, blob)
         return _deduplicate_records(
             [
                 ModuleRecord(
@@ -129,6 +145,8 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                     external=True,
                     source_path=str(path.resolve()),
                     sha256=digest,
+                    lte_combos=lte,
+                    nr_combos=nr,
                 )
             ],
             path,
@@ -159,6 +177,18 @@ def scan_source(path: Path) -> list[ModuleRecord]:
             continue
         raw = fat._read_clusters(entry.first_cluster)[: entry.size]
         digest = hashlib.sha256(raw).hexdigest()
+        temp_record = ModuleRecord(
+            inner_path=inner_path,
+            name=entry.name,
+            generation=generation,
+            size=entry.size,
+            hwid=int(match.group("hwid")),
+            fsid=int(match.group("fsid")),
+            bid=int(match.group("bid")),
+            source_path=str(path.resolve()),
+            sha256=digest,
+        )
+        lte, nr = _combo_counts(temp_record, raw)
         records.append(
             ModuleRecord(
                 inner_path=inner_path,
@@ -170,6 +200,8 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                 bid=int(match.group("bid")),
                 source_path=str(path.resolve()),
                 sha256=digest,
+                lte_combos=lte,
+                nr_combos=nr,
             )
         )
     return _deduplicate_records(_sort_records(records), path)
@@ -203,7 +235,22 @@ def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleR
                 mbn_path.name,
                 ", ".join(sorted(sidecars)),
             )
-        digest = hashlib.sha256(mbn_path.read_bytes()).hexdigest()
+        blob = mbn_path.read_bytes()
+        digest = hashlib.sha256(blob).hexdigest()
+        temp_record = ModuleRecord(
+            inner_path=inner_rel,
+            name=mbn_path.name,
+            generation=generation,
+            size=mbn_path.stat().st_size,
+            hwid=int(match.group("hwid")),
+            fsid=int(match.group("fsid")),
+            bid=int(match.group("bid")),
+            external=True,
+            source_path=str(mbn_path.resolve()),
+            sidecars=sidecars,
+            sha256=digest,
+        )
+        lte, nr = _combo_counts(temp_record, blob)
         records.append(
             ModuleRecord(
                 inner_path=inner_rel,
@@ -217,6 +264,8 @@ def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleR
                 source_path=str(mbn_path.resolve()),
                 sidecars=sidecars,
                 sha256=digest,
+                lte_combos=lte,
+                nr_combos=nr,
             )
         )
     return _sort_records(records)
@@ -1042,6 +1091,30 @@ def _counts(parsed: dict[str, Any]) -> dict[str, int]:
         table = combo["table"]
         counts[table] = counts.get(table, 0) + 1
     return counts
+
+
+def _combo_counts(
+    record: ModuleRecord, blob: bytes
+) -> tuple[int, str]:
+    """Return (lte_ca_count, nr_breakdown_string) for an MBN.
+
+    The NR string has the form ``endc+nr_ca+nrdc=total``.  Errors are
+    surfaced as ``(-1, "—")`` so the GUI can still display the row.
+    """
+    try:
+        parsed = parse_module(record, blob)
+        counts = _counts(parsed)
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "Failed to count combos for %s: %s", record.name, exc
+        )
+        return -1, "—"
+    lte = counts.get("lte_ca", 0)
+    endc = counts.get("endc", 0)
+    nr_ca = counts.get("nr_ca", 0)
+    nrdc = counts.get("nrdc", 0)
+    total = endc + nr_ca + nrdc
+    return lte, f"{endc}+{nr_ca}+{nrdc}={total}"
 
 
 def export_module(
