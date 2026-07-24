@@ -174,8 +174,11 @@ class ExtractorGUI:
 
     @staticmethod
     def _record_key(record: ModuleRecord) -> str:
-        source = record.source_path or "<unknown-source>"
-        return f"{source}\0{record.inner_path}"
+        # Deduplicate by file name and SHA-256 hash so the same content is not
+        # shown again when it is extracted from different scratch directories or
+        # imported more than once in the same session.
+        digest = record.sha256 or ""
+        return f"{record.name}\0{digest}"
 
     def _update_source_label(self) -> None:
         count = len(self.imported_sources)

@@ -65,6 +65,7 @@ class ModuleRecord:
     external: bool = False
     source_path: str = ""
     sidecars: dict[str, str] = field(default_factory=dict)
+    sha256: str = ""
 
     @property
     def identity(self) -> str:
@@ -114,6 +115,7 @@ def scan_source(path: Path) -> list[ModuleRecord]:
     direct = _matches_candidate(path.name)
     if direct:
         generation, match = direct
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
         return _deduplicate_records(
             [
                 ModuleRecord(
@@ -126,6 +128,7 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                     bid=int(match.group("bid")),
                     external=True,
                     source_path=str(path.resolve()),
+                    sha256=digest,
                 )
             ],
             path,
@@ -154,6 +157,8 @@ def scan_source(path: Path) -> list[ModuleRecord]:
         # This prevents unrelated numeric MCFG files from appearing as RF cards.
         if generation == "Legacy ELF" and "/so/" not in inner_path.casefold():
             continue
+        raw = fat._read_clusters(entry.first_cluster)[: entry.size]
+        digest = hashlib.sha256(raw).hexdigest()
         records.append(
             ModuleRecord(
                 inner_path=inner_path,
@@ -164,6 +169,7 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                 fsid=int(match.group("fsid")),
                 bid=int(match.group("bid")),
                 source_path=str(path.resolve()),
+                sha256=digest,
             )
         )
     return _deduplicate_records(_sort_records(records), path)
@@ -197,6 +203,7 @@ def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleR
                 mbn_path.name,
                 ", ".join(sorted(sidecars)),
             )
+        digest = hashlib.sha256(mbn_path.read_bytes()).hexdigest()
         records.append(
             ModuleRecord(
                 inner_path=inner_rel,
@@ -209,6 +216,7 @@ def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleR
                 external=True,
                 source_path=str(mbn_path.resolve()),
                 sidecars=sidecars,
+                sha256=digest,
             )
         )
     return _sort_records(records)
@@ -240,15 +248,21 @@ def _deduplicate_records(
     seen: set[tuple[str, str]] = set()
     unique: list[ModuleRecord] = []
     for record in records:
-        try:
-            blob = read_module(source, record) if source else Path(record.source_path).read_bytes()
-        except OSError as exc:
-            logging.getLogger(__name__).warning(
-                "Cannot hash %s for deduplication: %s", record.name, exc
-            )
-            unique.append(record)
-            continue
-        digest = hashlib.sha256(blob).hexdigest()
+        digest = record.sha256
+        if not digest:
+            try:
+                blob = (
+                    read_module(source, record)
+                    if source
+                    else Path(record.source_path).read_bytes()
+                )
+            except OSError as exc:
+                logging.getLogger(__name__).warning(
+                    "Cannot hash %s for deduplication: %s", record.name, exc
+                )
+                unique.append(record)
+                continue
+            digest = hashlib.sha256(blob).hexdigest()
         key = (record.name, digest)
         if key in seen:
             logging.getLogger(__name__).info(
