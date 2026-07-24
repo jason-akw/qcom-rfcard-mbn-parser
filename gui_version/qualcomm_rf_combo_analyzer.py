@@ -1297,7 +1297,7 @@ def _variant_note(
     removed_topology = _signature_topology(removed)
 
     if removed_topology is None:
-        return "Combo completely gone"
+        return "DELETED"
 
     candidates = [
         candidate
@@ -1306,7 +1306,7 @@ def _variant_note(
     ]
 
     if not candidates:
-        return "Combo completely gone"
+        return "DELETED"
 
     removed_bw = _signature_bw(removed)
     removed_mimo = _signature_mimo(removed)
