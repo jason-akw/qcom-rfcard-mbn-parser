@@ -95,8 +95,9 @@ class ExtractorGUI:
             self.tree.column(
                 column,
                 width=widths[column],
+                minwidth=widths[column] // 2,
                 anchor="center" if column in {"extract", "generation", "identity", "size", "lte", "nr"} else "w",
-                stretch=column == "path",
+                stretch=False,
             )
         y_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         x_scroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
