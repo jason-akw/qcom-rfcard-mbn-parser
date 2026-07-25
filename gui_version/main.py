@@ -205,6 +205,9 @@ class ExtractorGUI:
     def choose_source(self) -> None:
         from tkinter import filedialog
 
+        if self.busy:
+            return
+
         filenames = filedialog.askopenfilenames(
             title="Choose Qualcomm modem images or RF MBNs",
             filetypes=(
@@ -220,7 +223,14 @@ class ExtractorGUI:
         if not filenames:
             return
 
-        sources = [Path(filename).resolve() for filename in filenames]
+        # Deduplicate by resolved path so the same file selected more than
+        # once (or returned twice by the platform dialog) is only scanned once.
+        sources = list(dict.fromkeys(
+            Path(filename).resolve() for filename in filenames
+        ))
+
+        if not sources:
+            return
 
         self.set_busy(
             True,
@@ -314,83 +324,6 @@ class ExtractorGUI:
                 f"Failed to scan {len(failures)} source(s).\n\n"
                 "See the log for details.",
             )
-    def multi_scan_finished(
-        self,
-        results: list[tuple[Path, list[ModuleRecord]]],
-        failures: list[tuple[Path, str]],
-    ) -> None:
-        from tkinter import messagebox
-
-        existing_keys = {
-            self._record_key(record)
-            for record in self.records
-        }
-
-        total_found = 0
-        total_added = 0
-        total_duplicates = 0
-
-        for source, records in results:
-            total_found += len(records)
-            added_from_source = 0
-
-            for record in records:
-                key = self._record_key(record)
-
-                if key in existing_keys:
-                    total_duplicates += 1
-                    continue
-
-                existing_keys.add(key)
-                self.records.append(record)
-                self.checked_keys.add(key)
-                total_added += 1
-                added_from_source += 1
-
-            if source not in self.imported_sources:
-                self.imported_sources.append(source)
-
-            self.append_log(
-                f"Added {added_from_source} candidate RF MBN(s) "
-                f"from {source.name}."
-            )
-
-        for source, error in failures:
-            final_line = error.strip().splitlines()[-1]
-            self.append_log(f"Failed to scan {source}: {final_line}")
-
-        self._update_source_label()
-        self.refresh_tree()
-
-        self.set_busy(
-            False,
-            f"Added {total_added} MBN(s) from {len(results)} source(s); "
-            f"{len(self.records)} total imported.",
-        )
-
-        if total_duplicates:
-            self.append_log(
-                f"Skipped {total_duplicates} duplicate MBN row(s)."
-            )
-
-        if failures:
-            messagebox.showwarning(
-                "Some imports failed",
-                f"Successfully scanned {len(results)} source(s).\n"
-                f"Failed to scan {len(failures)} source(s).\n\n"
-                "See the log for details.",
-            )
-
-        def work() -> None:
-            try:
-                records = scan_source(source)
-            except Exception:
-                error = traceback.format_exc()
-                self.root.after(0, lambda: self.scan_failed(error))
-                return
-            self.root.after(0, lambda: self.scan_finished(source, records))
-
-        threading.Thread(target=work, daemon=True).start()
 
     def scan_failed(self, error: str) -> None:
         from tkinter import messagebox
