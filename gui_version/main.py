@@ -209,10 +209,10 @@ class ExtractorGUI:
             filetypes=(
                 (
                     "Modem images, archives, and MBNs",
-                    "*.img *.bin *.mbn *.gz *.xz *.zst *.zip *.tar *.tgz *.7z",
+                    "*.img *.bin *.mbn *.gz *.xz *.zst *.zip *.tar *.tar.md5 *.tgz *.lz4 *.7z",
                 ),
                 ("MBN files", "*.mbn"),
-                ("Modem images and archives", "*.img *.bin *.gz *.xz *.zst *.zip *.tar *.tgz *.7z"),
+                ("Modem images and archives", "*.img *.bin *.gz *.xz *.zst *.zip *.tar *.tar.md5 *.tgz *.lz4 *.7z"),
                 ("All files", "*.*"),
             ),
         )

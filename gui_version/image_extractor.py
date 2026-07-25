@@ -232,6 +232,8 @@ def detect(path: Path) -> str:
         return "xz"
     if head.startswith(b"\x28\xb5\x2f\xfd"):
         return "zstd"
+    if head.startswith(b"\x04\x22\x4d\x18"):
+        return "lz4"
     if head.startswith(b"PK\x03\x04"):
         return "zip"
     if head[:4] == b"7z\xbc\xaf" and head[4:6] == b"\x27\x1c":
@@ -395,6 +397,27 @@ def extract_zstd(path: Path, ctx: ExtractContext) -> Path | None:
     return out
 
 
+def extract_lz4(path: Path, ctx: ExtractContext) -> Path | None:
+    out = _new_workdir(ctx, "lz4") / (path.stem or "inner.bin")
+    if _have("lz4"):
+        res = _run(["lz4", "-d", "-f", str(path), str(out)])
+        if res.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            return out
+        logger.warning("lz4 binary failed on %s: %s", path, _stderr(res))
+    try:
+        import lz4.frame  # type: ignore[import-not-found]
+    except ImportError:
+        logger.warning("lz4 binary missing and python 'lz4' not installed")
+        return None
+    try:
+        with path.open("rb") as src, out.open("wb") as dst:
+            shutil.copyfileobj(lz4.frame.LZ4FrameFile(src), dst, length=1 << 20)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("lz4 decompress failed for %s: %s", path, exc)
+        return None
+    return out
+
+
 def extract_tar(path: Path, ctx: ExtractContext) -> Path | None:
     out = _new_workdir(ctx, "tar")
     try:
@@ -474,6 +497,7 @@ EXTRACTORS: dict[str, Callable[[Path, ExtractContext], Path | None]] = {
     "gzip": extract_gzip,
     "xz": extract_xz,
     "zstd": extract_zstd,
+    "lz4": extract_lz4,
     "zip": lambda p, c: extract_7z(p, c, "zip"),
     "7z": lambda p, c: extract_7z(p, c, "7z"),
     "tar": extract_tar,
