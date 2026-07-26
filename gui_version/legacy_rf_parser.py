@@ -44,8 +44,10 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
-COMBO_RECORD_SIZE = 40
-BAND_GROUP_RECORD_SIZE = 12
+LEGACY_COMBO_RECORD_SIZE = 40
+LEGACY_BAND_GROUP_RECORD_SIZE = 12
+MODERN_COMBO_RECORD_SIZE = 44
+MODERN_BAND_GROUP_RECORD_SIZE = 12
 MAX_GROUPS_PER_COMBO = 12
 UNUSED_GROUP_INDEX = 0xFFFF
 
@@ -408,6 +410,10 @@ class Descriptor:
     antenna_table_count: int
     band_group_count: int
     count_byte_offset: int
+    combo_record_size: int
+    band_group_record_size: int
+    descriptor_layout: str
+    antenna_table_va: int | None
 
 
 class Elf32Image:
@@ -583,105 +589,107 @@ def validate_candidate(
     descriptor_offset: int,
     *,
     exhaustive: bool,
-) -> tuple[int, int, int, int, int, int] | None:
-    """Return layout details when a possible four-word descriptor is consistent."""
-    if descriptor_offset < 0 or descriptor_offset + 16 > len(data):
+) -> tuple[int, int, int, int, int, int, int, int, str, int | None] | None:
+    """Validate either the legacy 40/12-byte layout or Xperia 44/8-byte layout."""
+    if descriptor_offset < 0 or descriptor_offset + 20 > len(data):
         return None
-    combo_count, combos_va, groups_va, antenna_count = struct.unpack_from(
-        "<4I", data, descriptor_offset
-    )
+
+    words = struct.unpack_from("<5I", data, descriptor_offset)
+    combo_count, combos_va, groups_va = words[:3]
     if not 1 <= combo_count <= 100_000:
         return None
-    if not 1 <= antenna_count <= 512:
-        return None
 
-    combos_offset = image.va_to_offset(
-        combos_va, combo_count * COMBO_RECORD_SIZE
-    )
-    groups_offset = image.va_to_offset(groups_va, BAND_GROUP_RECORD_SIZE)
-    if combos_offset is None or groups_offset is None:
-        return None
+    layouts: list[tuple[str, int, int, int, int | None]] = []
+    # Legacy: count, combos_va, groups_va, antenna_count
+    legacy_antenna_count = words[3]
+    if 1 <= legacy_antenna_count <= 512:
+        layouts.append(("legacy_40_12", LEGACY_COMBO_RECORD_SIZE,
+                        LEGACY_BAND_GROUP_RECORD_SIZE, legacy_antenna_count, None))
+    # Xperia/new generated layout: count, combos_va, groups_va,
+    # antenna_table_va, antenna_count
+    modern_antenna_va, modern_antenna_count = words[3], words[4]
+    if 1 <= modern_antenna_count <= 512 and image.va_to_offset(modern_antenna_va, 1) is not None:
+        layouts.append(("xperia_44_12", MODERN_COMBO_RECORD_SIZE,
+                        MODERN_BAND_GROUP_RECORD_SIZE, modern_antenna_count,
+                        modern_antenna_va))
 
-    if exhaustive:
-        record_indices: Sequence[int] = range(combo_count)
-    else:
-        record_indices = sorted(
-            {0, 1, combo_count // 4, combo_count // 2, combo_count - 1}
-        )
+    for layout_name, combo_size, group_size, antenna_count, antenna_va in layouts:
+        combos_offset = image.va_to_offset(combos_va, combo_count * combo_size)
+        groups_offset = image.va_to_offset(groups_va, group_size)
+        if combos_offset is None or groups_offset is None:
+            continue
 
-    selected_count_offset: int | None = None
-    highest_group = -1
-    for candidate_count_offset in (27, 26):
-        candidate_highest = -1
-        valid = True
-        for combo_index in record_indices:
-            record_offset = combos_offset + combo_index * COMBO_RECORD_SIZE
+        record_indices: Sequence[int]
+        if exhaustive:
+            record_indices = range(combo_count)
+        else:
+            record_indices = sorted({0, 1, combo_count // 4, combo_count // 2, combo_count - 1})
+
+        selected_count_offset: int | None = None
+        highest_group = -1
+        for candidate_count_offset in (27, 26):
+            candidate_highest = -1
+            valid = True
+            for combo_index in record_indices:
+                record_offset = combos_offset + combo_index * combo_size
+                try:
+                    group_indices, _, _, _, num_entries, _, _, _ = read_combo_header(
+                        data, record_offset, candidate_count_offset
+                    )
+                except (IndexError, struct.error):
+                    valid = False
+                    break
+                if not 1 <= num_entries <= MAX_GROUPS_PER_COMBO:
+                    valid = False
+                    break
+                active = group_indices[:num_entries]
+                if any(index == UNUSED_GROUP_INDEX for index in active):
+                    valid = False
+                    break
+                if num_entries < MAX_GROUPS_PER_COMBO and group_indices[num_entries] != UNUSED_GROUP_INDEX:
+                    valid = False
+                    break
+                candidate_highest = max(candidate_highest, *active)
+            if valid:
+                selected_count_offset = candidate_count_offset
+                highest_group = candidate_highest
+                break
+
+        if selected_count_offset is None:
+            continue
+
+        if not exhaustive:
+            return (combo_count, combos_offset, groups_offset, antenna_count,
+                    highest_group, selected_count_offset, combo_size, group_size,
+                    layout_name, antenna_va)
+
+        band_group_count = highest_group + 1
+        if image.va_to_offset(groups_va, band_group_count * group_size) is None:
+            continue
+
+        valid_groups = True
+        for group_index in range(band_group_count):
+            group_offset = groups_offset + group_index * group_size
             try:
-                group_indices, _, _, _, num_entries, _, _, _ = read_combo_header(
-                    data, record_offset, candidate_count_offset
-                )
-            except (IndexError, struct.error):
-                valid = False
+                words16 = struct.unpack_from("<4H" if group_size == 8 else "<6H", data, group_offset)
+            except struct.error:
+                valid_groups = False
                 break
-            if not 1 <= num_entries <= MAX_GROUPS_PER_COMBO:
-                valid = False
+            rat_id = words16[0] & 0x3
+            band = (words16[0] >> 2) & 0x1FF
+            if rat_id not in (1, 2) or not 1 <= band <= 511:
+                valid_groups = False
                 break
-            active = group_indices[:num_entries]
-            if any(index == UNUSED_GROUP_INDEX for index in active):
-                valid = False
+            dl_antenna_index = (words16[2] >> 6) & 0x7F
+            ul_antenna_index = (words16[2] >> 13) & 0x7
+            if dl_antenna_index >= antenna_count or ul_antenna_index >= antenna_count:
+                valid_groups = False
                 break
-            if (
-                num_entries < MAX_GROUPS_PER_COMBO
-                and group_indices[num_entries] != UNUSED_GROUP_INDEX
-            ):
-                valid = False
-                break
-            candidate_highest = max(candidate_highest, *active)
-        if valid:
-            selected_count_offset = candidate_count_offset
-            highest_group = candidate_highest
-            break
-
-    if selected_count_offset is None:
-        return None
-
-    if not exhaustive:
-        return (
-            combo_count,
-            combos_offset,
-            groups_offset,
-            antenna_count,
-            highest_group,
-            selected_count_offset,
-        )
-
-    band_group_count = highest_group + 1
-    if image.va_to_offset(
-        groups_va, band_group_count * BAND_GROUP_RECORD_SIZE
-    ) is None:
-        return None
-
-    for group_index in range(band_group_count):
-        group_offset = groups_offset + group_index * BAND_GROUP_RECORD_SIZE
-        words = struct.unpack_from("<6H", data, group_offset)
-        rat_id = words[0] & 0x3
-        band = (words[0] >> 2) & 0x1FF
-        if rat_id not in (1, 2) or not 1 <= band <= 511:
-            return None
-        dl_antenna_index = (words[2] >> 6) & 0x7F
-        ul_antenna_index = (words[2] >> 13) & 0x7
-        if dl_antenna_index >= antenna_count or ul_antenna_index >= antenna_count:
-            return None
-
-    return (
-        combo_count,
-        combos_offset,
-        groups_offset,
-        antenna_count,
-        highest_group,
-        selected_count_offset,
-    )
-
+        if valid_groups:
+            return (combo_count, combos_offset, groups_offset, antenna_count,
+                    highest_group, selected_count_offset, combo_size, group_size,
+                    layout_name, antenna_va)
+    return None
 
 def find_descriptors(data: bytes, image: Elf32Image) -> list[Descriptor]:
     """Find every valid Qualcomm 40-byte RF-combination table descriptor."""
@@ -717,7 +725,7 @@ def descriptor_rat_signatures(
     """Return the RAT set used by each kind of combination in a table."""
     signatures: set[frozenset[int]] = set()
     for combo_index in range(descriptor.combo_count):
-        offset = descriptor.combos_file_offset + combo_index * COMBO_RECORD_SIZE
+        offset = descriptor.combos_file_offset + combo_index * descriptor.combo_record_size
         group_indices, _, _, _, num_entries, _, _, _ = read_combo_header(
             data, offset, descriptor.count_byte_offset
         )
@@ -725,7 +733,7 @@ def descriptor_rat_signatures(
         for group_index in group_indices[:num_entries]:
             group_offset = (
                 descriptor.band_groups_file_offset
-                + group_index * BAND_GROUP_RECORD_SIZE
+                + group_index * descriptor.band_group_record_size
             )
             band_code = struct.unpack_from("<H", data, group_offset)[0]
             rats.add(band_code & 0x3)
@@ -773,7 +781,7 @@ def make_descriptor(
     data: bytes,
     image: Elf32Image,
     descriptor_offset: int,
-    validated_layout: tuple[int, int, int, int, int, int] | None = None,
+    validated_layout: tuple[int, int, int, int, int, int, int, int, str, int | None] | None = None,
 ) -> Descriptor:
     layout = validated_layout or validate_candidate(
         data, image, descriptor_offset, exhaustive=True
@@ -789,11 +797,15 @@ def make_descriptor(
         antenna_count,
         highest_group,
         count_byte_offset,
+        combo_record_size,
+        band_group_record_size,
+        descriptor_layout,
+        antenna_table_va,
     ) = layout
-    _, combos_va, groups_va, _ = struct.unpack_from("<4I", data, descriptor_offset)
+    _, combos_va, groups_va = struct.unpack_from("<3I", data, descriptor_offset)
     return Descriptor(
         file_offset=descriptor_offset,
-        virtual_address=image.offset_to_va(descriptor_offset, 16),
+        virtual_address=image.offset_to_va(descriptor_offset, 20),
         combo_count=combo_count,
         combos_va=combos_va,
         combos_file_offset=combos_offset,
@@ -802,12 +814,18 @@ def make_descriptor(
         antenna_table_count=antenna_count,
         band_group_count=highest_group + 1,
         count_byte_offset=count_byte_offset,
+        combo_record_size=combo_record_size,
+        band_group_record_size=band_group_record_size,
+        descriptor_layout=descriptor_layout,
+        antenna_table_va=antenna_table_va,
     )
 
-
 def parse_band_group(data: bytes, descriptor: Descriptor, index: int) -> dict[str, Any]:
-    offset = descriptor.band_groups_file_offset + index * BAND_GROUP_RECORD_SIZE
-    words = struct.unpack_from("<6H", data, offset)
+    offset = descriptor.band_groups_file_offset + index * descriptor.band_group_record_size
+    if descriptor.band_group_record_size == 8:
+        words = struct.unpack_from("<4H", data, offset) + (0, 0)
+    else:
+        words = struct.unpack_from("<6H", data, offset)
     band_code = words[0]
     rat_id = band_code & 0x3
     band = (band_code >> 2) & 0x1FF
@@ -830,7 +848,7 @@ def parse_band_group(data: bytes, descriptor: Descriptor, index: int) -> dict[st
         "group_index": index,
         "file_offset": offset,
         "file_offset_hex": f"0x{offset:X}",
-        "raw_hex": data[offset : offset + BAND_GROUP_RECORD_SIZE].hex(" "),
+        "raw_hex": data[offset : offset + descriptor.band_group_record_size].hex(" "),
         "raw_words": list(words),
         "band_code_raw": band_code,
         "band_code_hex": f"0x{band_code:04X}",
@@ -888,13 +906,55 @@ def canonical_combination(
     return f"CA_{lte_text}"
 
 
+
+UL_TX_SWITCH_LABELS = {
+    0: "none",
+    1: "switched_ul",
+    2: "dual_ul",
+    3: "both",
+}
+
+
+def decode_combo_property_byte(value: int) -> dict[str, Any]:
+    """Decode the shared legacy RF combination-property byte.
+
+    Confirmed layout:
+
+        bits 0..2  power-class enum
+        bit 3      TDD antenna-switch / FDD disruption
+        bit 4      simultaneous Rx/Tx inter-band EN-DC
+        bit 5      simultaneous Rx/Tx inter-band CA
+        bits 6..7  UL TX-switch type
+
+    Later bytes differ between X70, X75 and Sony/Xperia generated layouts, so
+    those bytes remain raw unless separately validated.
+    """
+    value &= 0xFF
+    power_class = value & 0x07
+    ul_tx_switch = (value >> 6) & 0x03
+    return {
+        "property_byte_raw": value,
+        "property_byte_hex": f"0x{value:02X}",
+        "power_class_raw": power_class,
+        "power_class": power_class,
+        "power_class_label": (
+            f"PC{power_class}" if power_class else "unspecified"
+        ),
+        "tdd_ant_swt_fdd_disruption": bool(value & 0x08),
+        "simultaneous_rx_tx_endc": bool(value & 0x10),
+        "simultaneous_rx_tx_ca": bool(value & 0x20),
+        "ul_tx_switch_type_raw": ul_tx_switch,
+        "ul_tx_switch_type": ul_tx_switch,
+        "ul_tx_switch_label": UL_TX_SWITCH_LABELS[ul_tx_switch],
+    }
+
 def parse_combo(
     data: bytes,
     descriptor: Descriptor,
     band_groups: Sequence[dict[str, Any]],
     combo_index: int,
 ) -> dict[str, Any]:
-    offset = descriptor.combos_file_offset + combo_index * COMBO_RECORD_SIZE
+    offset = descriptor.combos_file_offset + combo_index * descriptor.combo_record_size
     (
         all_group_indices,
         combo_flags,
@@ -913,6 +973,13 @@ def parse_combo(
         entries.append(entry)
 
     rats = {entry["rat"] for entry in entries}
+    property_fields = decode_combo_property_byte(combo_flags)
+    combo_extension_word = (
+        struct.unpack_from("<I", data, offset + 40)[0]
+        if descriptor.combo_record_size >= 44
+        else None
+    )
+
     if rats == {"LTE", "NR"}:
         rat_mix = "EN-DC"
     elif rats == {"NR"}:
@@ -926,7 +993,7 @@ def parse_combo(
         "combo_index": combo_index,
         "file_offset": offset,
         "file_offset_hex": f"0x{offset:X}",
-        "raw_hex": data[offset : offset + COMBO_RECORD_SIZE].hex(" "),
+        "raw_hex": data[offset : offset + descriptor.combo_record_size].hex(" "),
         "rat_mix": rat_mix,
         "combination_source_order": "+".join(
             entry["band_label"] for entry in entries
@@ -940,8 +1007,13 @@ def parse_combo(
         ),
         "group_indices": group_indices,
         "all_group_indices_raw": list(all_group_indices),
+        # combo_flags is retained for compatibility. It is the same source
+        # byte exposed below as property_byte_raw.
         "combo_flags": combo_flags,
         "combo_flags_hex": f"0x{combo_flags:02X}",
+        **property_fields,
+        "bcs_num": None,
+        "higher_power_limit": None,
         "reserved_byte_1": reserved_byte_1,
         "reserved_byte_2": reserved_byte_2,
         "num_band_entries": num_band_entries,
@@ -950,6 +1022,8 @@ def parse_combo(
         "envelope_mask_hex": f"0x{envelope_mask:08X}",
         "subset_mask": subset_mask,
         "subset_mask_hex": f"0x{subset_mask:08X}",
+        "extension_word": combo_extension_word,
+        "extension_word_hex": (f"0x{combo_extension_word:08X}" if combo_extension_word is not None else None),
         "entries": entries,
     }
 
@@ -972,6 +1046,11 @@ def parse_descriptor(
         parse_combo(data, descriptor, band_groups, index)
         for index in range(descriptor.combo_count)
     ]
+    if table_kind == "nrdc":
+        for combo in combinations:
+            combo["rat_mix"] = "NR-DC"
+            combo["combination"] = combo["combination"].replace("NRCA_", "NRDC_", 1)
+            combo["combination_with_classes"] = combo["combination_with_classes"].replace("NRCA_", "NRDC_", 1)
     used_group_indices = sorted(
         {
             group_index
@@ -996,14 +1075,15 @@ def parse_descriptor(
             "b826_source_index": source_index,
             "detected_table_count": detected_table_count,
             "descriptor_discovery": discovery,
-            "combo_record_size": COMBO_RECORD_SIZE,
+            "combo_record_size": descriptor.combo_record_size,
             "component_count_byte_offset": descriptor.count_byte_offset,
-            "band_group_record_size": BAND_GROUP_RECORD_SIZE,
+            "band_group_record_size": descriptor.band_group_record_size,
             "known_bandwidth_parts_mhz": KNOWN_BANDWIDTH_PARTS_MHZ,
             "notes": [
                 "Unknown bandwidth and feature codes are retained as raw values.",
                 "Some rare Qualcomm bandwidth-index mappings are inferred.",
                 "BC_ID is not stored in these hardware RF source records.",
+                "Combination-property bits 0..2 are power class; bits 6..7 are UL TX switching.",
                 "DL bandwidth class uses the high five bits of band_code.",
                 "B826 repacks these source records; it is not a byte-for-byte copy.",
             ],
@@ -1030,6 +1110,9 @@ def parse_descriptor(
             "used_band_group_count": len(used_group_indices),
             "used_band_group_indices": used_group_indices,
             "antenna_table_count": descriptor.antenna_table_count,
+            "descriptor_layout": descriptor.descriptor_layout,
+            "antenna_table_va": descriptor.antenna_table_va,
+            "antenna_table_va_hex": (f"0x{descriptor.antenna_table_va:X}" if descriptor.antenna_table_va is not None else None),
         },
         "antenna_table": [
             {
@@ -1076,9 +1159,25 @@ def parse_tables(
         (classify_descriptor(data, descriptor), descriptor)
         for descriptor in descriptors
     ]
+    # NR-CA and NR-DC both contain only NR components, so RAT makeup alone
+    # cannot distinguish them. In generated Xperia tables, the primary/larger
+    # NR-only table is NR-CA and any additional smaller NR-only table is NR-DC.
+    nr_only_positions = [
+        index for index, (kind, _descriptor) in enumerate(classified)
+        if kind == "nrca"
+    ]
+    if len(nr_only_positions) > 1:
+        primary = max(
+            nr_only_positions,
+            key=lambda index: classified[index][1].combo_count,
+        )
+        classified = [
+            (("nrdc" if index in nr_only_positions and index != primary else kind), descriptor)
+            for index, (kind, descriptor) in enumerate(classified)
+        ]
     if table_kind == "all":
         selected = [
-            item for item in classified if item[0] in ("endc", "nrca")
+            item for item in classified if item[0] in ("endc", "nrca", "nrdc")
         ]
     else:
         selected = [item for item in classified if item[0] == table_kind]
@@ -1100,7 +1199,7 @@ def parse_tables(
 
     selected.sort(
         key=lambda item: (
-            {"endc": 0, "nrca": 1}.get(item[0], 9),
+            {"endc": 0, "nrca": 1, "nrdc": 2}.get(item[0], 9),
             item[1].file_offset,
         )
     )
@@ -1164,6 +1263,16 @@ def write_csv_exports(result: dict[str, Any], base: Path) -> list[Path]:
         "num_band_entries",
         "group_indices",
         "combo_flags_hex",
+        "property_byte_hex",
+        "power_class_raw",
+        "power_class_label",
+        "tdd_ant_swt_fdd_disruption",
+        "simultaneous_rx_tx_endc",
+        "simultaneous_rx_tx_ca",
+        "ul_tx_switch_type_raw",
+        "ul_tx_switch_label",
+        "bcs_num",
+        "higher_power_limit",
         "reserved_byte_1",
         "reserved_byte_2",
         "reserved_word",
@@ -1334,7 +1443,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--table",
-        choices=("endc", "nrca", "all"),
+        choices=("endc", "nrca", "nrdc", "all"),
         default="endc",
         help="RF table to parse (default: endc)",
     )

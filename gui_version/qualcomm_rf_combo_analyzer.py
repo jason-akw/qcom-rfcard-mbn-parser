@@ -683,7 +683,7 @@ def _legacy_b826_packets(
                         ul_qam_cap_index=0,
                     )
                 )
-            prop = SimpleNamespace(ul_tx_switch_type=int(combo["combo_flags"]) & 0x03)
+            prop = SimpleNamespace(ul_tx_switch_type=int(combo.get("ul_tx_switch_type_raw", 0)))
             records.append((groups, prop))
         packets = modern.b826_v22_packets(records, source) if records else []
         output.extend(
@@ -918,10 +918,10 @@ def parse_legacy(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
                     "combo_index": combo["combo_index"],
                     "expression": combo["combination_with_classes"],
                     "component_count": combo["num_band_entries"],
-                    "power_class": None,
-                    "bcs_num": None,
-                    "ul_tx_switch_type": int(combo["combo_flags"]) & 0x03,
-                    "higher_power_limit": None,
+                    "power_class": combo.get("power_class_raw"),
+                    "bcs_num": combo.get("bcs_num"),
+                    "ul_tx_switch_type": combo.get("ul_tx_switch_type_raw", 0),
+                    "higher_power_limit": combo.get("higher_power_limit"),
                     "descriptor_offset": result["descriptor"]["file_offset_hex"],
                     "combo_flags": combo["combo_flags"],
                     "envelope_mask": combo["envelope_mask"],
@@ -1098,17 +1098,57 @@ def _combo_counts(
 ) -> tuple[int, str]:
     """Return (lte_ca_count, nr_breakdown_string) for an MBN.
 
-    The NR string has the form ``endc+nr_ca+nrdc=total``.  Errors are
-    surfaced as ``(-1, "—")`` so the GUI can still display the row.
+    NR format: ``endc+nr_ca+nrdc=total``.
+
+    Legacy ELF files are counted from validated descriptors and the separate
+    50-byte LTE array, without fully decoding every combination.
     """
+    logger = logging.getLogger(__name__)
+
     try:
+        if record.generation in {"Legacy ELF", "legacy"} or blob.startswith(b"\\x7fELF"):
+            image = legacy.Elf32Image(blob)
+
+            # LTE CA is stored separately from the NR/EN-DC descriptor tables
+            # on these generated legacy RF-card modules.
+            lte_found = _find_legacy_lte_array(blob, image)
+            lte = lte_found[2] if lte_found is not None else 0
+
+            descriptors = legacy.find_descriptors(blob, image)
+            labeled = _legacy_table_labels(blob, descriptors)
+
+            endc = sum(
+                descriptor.combo_count
+                for table, descriptor, _note in labeled
+                if table == "endc"
+            )
+            nr_ca = sum(
+                descriptor.combo_count
+                for table, descriptor, _note in labeled
+                if table == "nr_ca"
+            )
+            nrdc = sum(
+                descriptor.combo_count
+                for table, descriptor, _note in labeled
+                if table == "nrdc"
+            )
+
+            total = endc + nr_ca + nrdc
+            return lte, f"{endc}+{nr_ca}+{nrdc}={total}"
+
+        # DAT/protobuf and other supported formats use the normal parser.
         parsed = parse_module(record, blob)
         counts = _counts(parsed)
+
     except Exception as exc:
-        logging.getLogger(__name__).debug(
-            "Failed to count combos for %s: %s", record.name, exc
+        logger.debug(
+            "Failed to count combos for %s: %s",
+            record.name,
+            exc,
+            exc_info=True,
         )
         return -1, "—"
+
     lte = counts.get("lte_ca", 0)
     endc = counts.get("endc", 0)
     nr_ca = counts.get("nr_ca", 0)
