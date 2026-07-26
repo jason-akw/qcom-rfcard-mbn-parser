@@ -681,7 +681,15 @@ def validate_candidate(
                 valid_groups = False
                 break
             dl_antenna_index = (words16[2] >> 6) & 0x7F
-            ul_antenna_index = (words16[2] >> 13) & 0x7
+            if layout_name == "xperia_44_12" or selected_count_offset == 26:
+                # Later generated packing continues the UL antenna enum into
+                # the low nibble of word 3.
+                ul_antenna_index = (
+                    ((words16[2] >> 13) & 0x7)
+                    | ((words16[3] & 0xF) << 3)
+                )
+            else:
+                ul_antenna_index = (words16[2] >> 13) & 0x7
             if dl_antenna_index >= antenna_count or ul_antenna_index >= antenna_count:
                 valid_groups = False
                 break
@@ -835,12 +843,42 @@ def parse_band_group(data: bytes, descriptor: Descriptor, index: int) -> dict[st
     dl_bw_class = bandwidth_class_label(dl_bw_class_code)
 
     dl_bw_code = words[1] & 0x3F
-    ul_present = bool((words[1] >> 6) & 1)
-    field_2_unknown_high = words[1] >> 7
+
+    # Qualcomm used two related 12-byte band-group packings.
+    #
+    # X70 legacy packing:
+    #   word1 bit 6      = UL present
+    #   word2 bits 13-15 = 3-bit UL antenna enum
+    #
+    # Later generated/X75/Sony packing:
+    #   word1 bits 6-10  = full 5-bit UL bandwidth class
+    #   word2 bits 13-15 = low 3 bits of UL antenna enum
+    #   word3 bits 0-3   = high 4 bits of UL antenna enum
+    #
+    # The later layout is used by 44-byte generated records and by the known
+    # X75 count-at-+26 revision.
+    later_packed = (
+        descriptor.descriptor_layout == "xperia_44_12"
+        or descriptor.count_byte_offset == 26
+    )
+    if later_packed:
+        ul_bw_class_code = (words[1] >> 6) & 0x1F
+        ul_present = ul_bw_class_code != 0
+        field_2_unknown_high = words[1] >> 11
+    else:
+        ul_present = bool((words[1] >> 6) & 1)
+        ul_bw_class_code = 1 if ul_present else 0
+        field_2_unknown_high = words[1] >> 7
 
     ul_bw_code = words[2] & 0x3F
     dl_antenna_index = (words[2] >> 6) & 0x7F
-    ul_antenna_index = (words[2] >> 13) & 0x7
+    if later_packed:
+        ul_antenna_index = (
+            ((words[2] >> 13) & 0x7)
+            | ((words[3] & 0xF) << 3)
+        )
+    else:
+        ul_antenna_index = (words[2] >> 13) & 0x7
     dl_pattern, dl_antenna_name = antenna_info(dl_antenna_index)
     ul_pattern, ul_antenna_name = antenna_info(ul_antenna_index)
 
@@ -864,6 +902,11 @@ def parse_band_group(data: bytes, descriptor: Descriptor, index: int) -> dict[st
         "dl_bandwidth": bandwidth_label(dl_bw_code),
         "dl_bandwidth_parts_mhz": bandwidth_parts(dl_bw_code),
         "ul_present": ul_present,
+        "ul_bw_class_code": ul_bw_class_code,
+        "ul_bw_class": bandwidth_class_label(ul_bw_class_code),
+        "band_group_layout": (
+            "later_generated_12" if later_packed else "x70_legacy_12"
+        ),
         "field_2_unknown_high": field_2_unknown_high,
         "ul_bw_code": ul_bw_code,
         "ul_bandwidth": bandwidth_label(ul_bw_code),
@@ -1084,6 +1127,7 @@ def parse_descriptor(
                 "Some rare Qualcomm bandwidth-index mappings are inferred.",
                 "BC_ID is not stored in these hardware RF source records.",
                 "Combination-property bits 0..2 are power class; bits 6..7 are UL TX switching.",
+                "Later generated band groups store UL class in word1 bits 6..10 and extend the UL antenna enum into word3 bits 0..3.",
                 "DL bandwidth class uses the high five bits of band_code.",
                 "B826 repacks these source records; it is not a byte-for-byte copy.",
             ],
@@ -1303,6 +1347,9 @@ def write_csv_exports(result: dict[str, Any], base: Path) -> list[Path]:
         "dl_bandwidth",
         "dl_bandwidth_parts_mhz",
         "ul_present",
+        "ul_bw_class_code",
+        "ul_bw_class",
+        "band_group_layout",
         "ul_bw_code",
         "ul_bandwidth",
         "ul_bandwidth_parts_mhz",
@@ -1354,6 +1401,9 @@ def write_csv_exports(result: dict[str, Any], base: Path) -> list[Path]:
         "dl_bandwidth",
         "dl_bandwidth_parts_mhz",
         "ul_present",
+        "ul_bw_class_code",
+        "ul_bw_class",
+        "band_group_layout",
         "field_2_unknown_high",
         "ul_bw_code",
         "ul_bandwidth",

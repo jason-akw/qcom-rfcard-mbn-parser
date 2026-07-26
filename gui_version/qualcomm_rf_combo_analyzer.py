@@ -676,7 +676,12 @@ def _legacy_b826_packets(
                         band=int(entry["band"]),
                         dl_bw_class=int(entry["dl_bw_class_code"]),
                         dl_bw_per_cc=int(entry["dl_bw_code"]),
-                        ul_bw_class=1 if entry["ul_present"] else 0,
+                        ul_bw_class=int(
+                            entry.get(
+                                "ul_bw_class_code",
+                                1 if entry["ul_present"] else 0,
+                            )
+                        ),
                         ul_bw_per_cc=int(entry["ul_bw_code"]),
                         dl_max_antennas_index=int(entry["dl_antenna_index"]),
                         ul_max_antennas_index=int(entry["ul_antenna_index"]),
@@ -944,8 +949,14 @@ def parse_legacy(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
                         "dl_bandwidth": entry["dl_bandwidth"],
                         "dl_antenna_index": entry["dl_antenna_index"],
                         "dl_antenna": entry["dl_antenna"],
-                        "ul_bw_class_code": 1 if entry["ul_present"] else 0,
-                        "ul_bw_class": "A" if entry["ul_present"] else "-",
+                        "ul_bw_class_code": entry.get(
+                            "ul_bw_class_code",
+                            1 if entry["ul_present"] else 0,
+                        ),
+                        "ul_bw_class": entry.get(
+                            "ul_bw_class",
+                            "A" if entry["ul_present"] else "-",
+                        ),
                         "ul_bw_code": entry["ul_bw_code"],
                         "ul_bandwidth": entry["ul_bandwidth"],
                         "ul_antenna_index": entry["ul_antenna_index"],
