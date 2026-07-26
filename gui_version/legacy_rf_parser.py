@@ -39,7 +39,7 @@ import hashlib
 import json
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -413,7 +413,21 @@ class Descriptor:
     combo_record_size: int
     band_group_record_size: int
     descriptor_layout: str
+    band_group_layout: str
     antenna_table_va: int | None
+
+
+@dataclass(frozen=True)
+class DynamicSymbol:
+    name: str
+    value: int
+    size: int
+    info: int
+    file_offset: int | None
+
+    @property
+    def symbol_type(self) -> int:
+        return self.info & 0x0F
 
 
 class Elf32Image:
@@ -489,6 +503,107 @@ class Elf32Image:
     def mapped_file_ranges(self) -> Iterable[tuple[int, int]]:
         for segment in self.load_segments:
             yield segment.file_offset, segment.file_offset + segment.file_size
+
+    def dynamic_symbols(self) -> list[DynamicSymbol]:
+        """Read the SysV dynamic symbol table without section headers.
+
+        Qualcomm RF-card ELFs commonly omit section headers but retain
+        PT_DYNAMIC, DT_HASH, DT_SYMTAB and DT_STRTAB.  DT_HASH supplies the
+        exact symbol count, so generated RF table symbols can be used as the
+        primary discovery mechanism.
+        """
+        data = self.data
+        phoff = struct.unpack_from("<I", data, 28)[0]
+        phentsize = struct.unpack_from("<H", data, 42)[0]
+        phnum = struct.unpack_from("<H", data, 44)[0]
+
+        dynamic_file_offset: int | None = None
+        dynamic_file_size = 0
+        for index in range(phnum):
+            offset = phoff + index * phentsize
+            (
+                segment_type,
+                file_offset,
+                _virtual_address,
+                _physical_address,
+                file_size,
+                _memory_size,
+                _flags,
+                _alignment,
+            ) = struct.unpack_from("<8I", data, offset)
+            if segment_type == 2:  # PT_DYNAMIC
+                dynamic_file_offset = file_offset
+                dynamic_file_size = file_size
+                break
+
+        if dynamic_file_offset is None:
+            return []
+
+        tags: dict[int, int] = {}
+        end = dynamic_file_offset + dynamic_file_size
+        for offset in range(dynamic_file_offset, end, 8):
+            tag, value = struct.unpack_from("<II", data, offset)
+            if tag == 0:
+                break
+            tags[tag] = value
+
+        # Required SysV dynamic entries.
+        hash_va = tags.get(4)    # DT_HASH
+        symtab_va = tags.get(6)  # DT_SYMTAB
+        strtab_va = tags.get(5)  # DT_STRTAB
+        syment = tags.get(11, 16)
+        strsz = tags.get(10)
+        if hash_va is None or symtab_va is None or strtab_va is None:
+            return []
+        if syment < 16:
+            return []
+
+        hash_offset = self.va_to_offset(hash_va, 8)
+        symtab_offset = self.va_to_offset(symtab_va, 16)
+        strtab_offset = self.va_to_offset(strtab_va, 1)
+        if hash_offset is None or symtab_offset is None or strtab_offset is None:
+            return []
+
+        _bucket_count, symbol_count = struct.unpack_from("<II", data, hash_offset)
+        if not 1 <= symbol_count <= 1_000_000:
+            return []
+
+        strtab_end = (
+            strtab_offset + strsz
+            if strsz is not None and strtab_offset + strsz <= len(data)
+            else len(data)
+        )
+
+        symbols: list[DynamicSymbol] = []
+        for index in range(symbol_count):
+            offset = symtab_offset + index * syment
+            if offset + 16 > len(data):
+                break
+            name_offset, value, size, info, _other, _section = struct.unpack_from(
+                "<IIIBBH", data, offset
+            )
+            string_offset = strtab_offset + name_offset
+            if not strtab_offset <= string_offset < strtab_end:
+                name = ""
+            else:
+                nul = data.find(b"\0", string_offset, strtab_end)
+                if nul < 0:
+                    name = ""
+                else:
+                    name = data[string_offset:nul].decode(
+                        "utf-8", errors="replace"
+                    )
+            mapped_size = size if size > 0 else 1
+            symbols.append(
+                DynamicSymbol(
+                    name=name,
+                    value=value,
+                    size=size,
+                    info=info,
+                    file_offset=self.va_to_offset(value, mapped_size),
+                )
+            )
+        return symbols
 
 
 def make_antenna_table() -> list[list[int]]:
@@ -583,13 +698,79 @@ def read_combo_header(
     )
 
 
+def infer_band_group_layout(
+    data: bytes,
+    groups_offset: int,
+    band_group_count: int,
+    group_size: int,
+    antenna_count: int,
+    *,
+    default_later: bool,
+) -> str:
+    """Infer the 12-byte band-group bit packing independently of combo layout.
+
+    Combo-record size and band-group packing evolved independently.  In
+    particular, Samsung Waipio/X65 modules can use 40-byte combo records with
+    the later full UL-class/extended-antenna band-group packing.
+
+    The later layout is considered proven when a group contains a plausible
+    multi-bit UL class that tracks the DL class, or when word 3 extends a valid
+    UL antenna enum beyond three bits.  Otherwise the caller's generation hint
+    is retained.
+    """
+    if group_size != 12:
+        return "compact_8"
+
+    if default_later:
+        return "later_generated_12"
+
+    strong_later_evidence = 0
+    for index in range(band_group_count):
+        offset = groups_offset + index * group_size
+        try:
+            words = struct.unpack_from("<6H", data, offset)
+        except struct.error:
+            break
+
+        dl_class = words[0] >> 11
+        ul_class_candidate = (words[1] >> 6) & 0x1F
+        old_ul_antenna = (words[2] >> 13) & 0x07
+        extended_ul_antenna = (
+            old_ul_antenna | ((words[3] & 0x0F) << 3)
+        )
+
+        # Strong example found in Samsung 847_a_0:
+        # DL G/H/I pairs with UL G/H/I.  The old one-bit interpretation would
+        # collapse these to A/absent.
+        if (
+            2 <= ul_class_candidate <= 26
+            and ul_class_candidate == dl_class
+        ):
+            strong_later_evidence += 1
+
+        # A non-zero extension nibble that creates a valid antenna enum is also
+        # direct evidence of the later packing.
+        if (
+            (words[3] & 0x0F) != 0
+            and extended_ul_antenna != old_ul_antenna
+            and extended_ul_antenna < antenna_count
+        ):
+            strong_later_evidence += 1
+
+    return (
+        "later_generated_12"
+        if strong_later_evidence
+        else "x70_legacy_12"
+    )
+
+
 def validate_candidate(
     data: bytes,
     image: Elf32Image,
     descriptor_offset: int,
     *,
     exhaustive: bool,
-) -> tuple[int, int, int, int, int, int, int, int, str, int | None] | None:
+) -> tuple[int, int, int, int, int, int, int, int, str, str, int | None] | None:
     """Validate either the legacy 40/12-byte layout or Xperia 44/8-byte layout."""
     if descriptor_offset < 0 or descriptor_offset + 20 > len(data):
         return None
@@ -658,14 +839,32 @@ def validate_candidate(
         if selected_count_offset is None:
             continue
 
+        default_later = (
+            layout_name == "xperia_44_12"
+            or selected_count_offset == 26
+        )
         if not exhaustive:
+            provisional_group_layout = (
+                "later_generated_12"
+                if default_later
+                else "x70_legacy_12"
+            )
             return (combo_count, combos_offset, groups_offset, antenna_count,
                     highest_group, selected_count_offset, combo_size, group_size,
-                    layout_name, antenna_va)
+                    layout_name, provisional_group_layout, antenna_va)
 
         band_group_count = highest_group + 1
         if image.va_to_offset(groups_va, band_group_count * group_size) is None:
             continue
+
+        band_group_layout = infer_band_group_layout(
+            data,
+            groups_offset,
+            band_group_count,
+            group_size,
+            antenna_count,
+            default_later=default_later,
+        )
 
         valid_groups = True
         for group_index in range(band_group_count):
@@ -681,7 +880,7 @@ def validate_candidate(
                 valid_groups = False
                 break
             dl_antenna_index = (words16[2] >> 6) & 0x7F
-            if layout_name == "xperia_44_12" or selected_count_offset == 26:
+            if band_group_layout == "later_generated_12":
                 # Later generated packing continues the UL antenna enum into
                 # the low nibble of word 3.
                 ul_antenna_index = (
@@ -696,12 +895,99 @@ def validate_candidate(
         if valid_groups:
             return (combo_count, combos_offset, groups_offset, antenna_count,
                     highest_group, selected_count_offset, combo_size, group_size,
-                    layout_name, antenna_va)
+                    layout_name, band_group_layout, antenna_va)
     return None
 
+NAMED_COMBO_TABLE_SUFFIXES = (
+    ("nr5g_nr5g_combos_info_table_sub_cap_high", "nrdc"),
+    ("lte_nr5g_combos_info_table_sub_cap_high", "endc"),
+    ("nr5g_combos_info_table_sub_cap_high", "nrca"),
+)
+
+
+def find_named_descriptors(
+    data: bytes,
+    image: Elf32Image,
+) -> list[tuple[str, Descriptor, str]]:
+    """Locate public high RF tables from generated dynamic-symbol names.
+
+    Symbol identity is authoritative for NR-CA versus NR-DC, which cannot be
+    distinguished from RAT composition alone.
+    """
+    found: list[tuple[str, Descriptor, str]] = []
+    seen_offsets: set[int] = set()
+    for symbol in image.dynamic_symbols():
+        name_lower = symbol.name.lower()
+        table_kind: str | None = None
+        for suffix, kind in NAMED_COMBO_TABLE_SUFFIXES:
+            if name_lower.endswith(suffix):
+                table_kind = kind
+                break
+        if table_kind is None or symbol.file_offset is None:
+            continue
+        if symbol.file_offset in seen_offsets:
+            continue
+        layout = validate_candidate(
+            data,
+            image,
+            symbol.file_offset,
+            exhaustive=True,
+        )
+        if layout is None:
+            continue
+        descriptor = make_descriptor(
+            data,
+            image,
+            symbol.file_offset,
+            layout,
+        )
+        found.append((table_kind, descriptor, symbol.name))
+        seen_offsets.add(symbol.file_offset)
+
+    # Band-group packing is a property of the shared group table, not of an
+    # individual combo descriptor. If any table proves the later packing,
+    # propagate it to every descriptor that references the same groups VA.
+    later_group_vas = {
+        descriptor.band_groups_va
+        for _kind, descriptor, _name in found
+        if descriptor.band_group_layout == "later_generated_12"
+    }
+    if later_group_vas:
+        found = [
+            (
+                kind,
+                replace(
+                    descriptor,
+                    band_group_layout="later_generated_12",
+                )
+                if descriptor.band_groups_va in later_group_vas
+                else descriptor,
+                symbol_name,
+            )
+            for kind, descriptor, symbol_name in found
+        ]
+
+    order = {"endc": 0, "nrca": 1, "nrdc": 2}
+    found.sort(
+        key=lambda item: (
+            order.get(item[0], 9),
+            item[1].file_offset,
+        )
+    )
+    return found
+
+
 def find_descriptors(data: bytes, image: Elf32Image) -> list[Descriptor]:
-    """Find every valid Qualcomm 40-byte RF-combination table descriptor."""
-    candidates: list[tuple[int, tuple[int, int, int, int, int]]] = []
+    """Find public RF-combination table descriptors.
+
+    Generated dynamic symbols are preferred. Structural scanning remains the
+    compatibility fallback for stripped ELFs.
+    """
+    named = find_named_descriptors(data, image)
+    if named:
+        return [descriptor for _kind, descriptor, _name in named]
+
+    candidates: list[tuple[int, tuple[int, ...]]] = []
     for range_start, range_end in image.mapped_file_ranges():
         aligned_start = (range_start + 3) & ~3
         for offset in range(aligned_start, range_end - 15, 4):
@@ -789,7 +1075,7 @@ def make_descriptor(
     data: bytes,
     image: Elf32Image,
     descriptor_offset: int,
-    validated_layout: tuple[int, int, int, int, int, int, int, int, str, int | None] | None = None,
+    validated_layout: tuple[int, int, int, int, int, int, int, int, str, str, int | None] | None = None,
 ) -> Descriptor:
     layout = validated_layout or validate_candidate(
         data, image, descriptor_offset, exhaustive=True
@@ -808,6 +1094,7 @@ def make_descriptor(
         combo_record_size,
         band_group_record_size,
         descriptor_layout,
+        band_group_layout,
         antenna_table_va,
     ) = layout
     _, combos_va, groups_va = struct.unpack_from("<3I", data, descriptor_offset)
@@ -825,6 +1112,7 @@ def make_descriptor(
         combo_record_size=combo_record_size,
         band_group_record_size=band_group_record_size,
         descriptor_layout=descriptor_layout,
+        band_group_layout=band_group_layout,
         antenna_table_va=antenna_table_va,
     )
 
@@ -857,10 +1145,7 @@ def parse_band_group(data: bytes, descriptor: Descriptor, index: int) -> dict[st
     #
     # The later layout is used by 44-byte generated records and by the known
     # X75 count-at-+26 revision.
-    later_packed = (
-        descriptor.descriptor_layout == "xperia_44_12"
-        or descriptor.count_byte_offset == 26
-    )
+    later_packed = descriptor.band_group_layout == "later_generated_12"
     if later_packed:
         ul_bw_class_code = (words[1] >> 6) & 0x1F
         ul_present = ul_bw_class_code != 0
@@ -904,9 +1189,7 @@ def parse_band_group(data: bytes, descriptor: Descriptor, index: int) -> dict[st
         "ul_present": ul_present,
         "ul_bw_class_code": ul_bw_class_code,
         "ul_bw_class": bandwidth_class_label(ul_bw_class_code),
-        "band_group_layout": (
-            "later_generated_12" if later_packed else "x70_legacy_12"
-        ),
+        "band_group_layout": descriptor.band_group_layout,
         "field_2_unknown_high": field_2_unknown_high,
         "ul_bw_code": ul_bw_code,
         "ul_bandwidth": bandwidth_label(ul_bw_code),
@@ -1155,6 +1438,7 @@ def parse_descriptor(
             "used_band_group_indices": used_group_indices,
             "antenna_table_count": descriptor.antenna_table_count,
             "descriptor_layout": descriptor.descriptor_layout,
+            "band_group_layout": descriptor.band_group_layout,
             "antenna_table_va": descriptor.antenna_table_va,
             "antenna_table_va_hex": (f"0x{descriptor.antenna_table_va:X}" if descriptor.antenna_table_va is not None else None),
         },
@@ -1198,27 +1482,38 @@ def parse_tables(
             )
         ]
 
-    descriptors = find_descriptors(data, image)
-    classified = [
-        (classify_descriptor(data, descriptor), descriptor)
-        for descriptor in descriptors
-    ]
-    # NR-CA and NR-DC both contain only NR components, so RAT makeup alone
-    # cannot distinguish them. In generated Xperia tables, the primary/larger
-    # NR-only table is NR-CA and any additional smaller NR-only table is NR-DC.
-    nr_only_positions = [
-        index for index, (kind, _descriptor) in enumerate(classified)
-        if kind == "nrca"
-    ]
-    if len(nr_only_positions) > 1:
-        primary = max(
-            nr_only_positions,
-            key=lambda index: classified[index][1].combo_count,
-        )
+    named = find_named_descriptors(data, image)
+    if named:
         classified = [
-            (("nrdc" if index in nr_only_positions and index != primary else kind), descriptor)
-            for index, (kind, descriptor) in enumerate(classified)
+            (kind, descriptor)
+            for kind, descriptor, _symbol_name in named
         ]
+        descriptors = [descriptor for _kind, descriptor in classified]
+        discovery_mode = "dynamic-symbol"
+    else:
+        descriptors = find_descriptors(data, image)
+        classified = [
+            (classify_descriptor(data, descriptor), descriptor)
+            for descriptor in descriptors
+        ]
+        discovery_mode = "structural"
+
+        # NR-CA and NR-DC both contain only NR components, so RAT makeup alone
+        # cannot distinguish them. This size rule is fallback-only for stripped
+        # ELFs; named symbols are authoritative when available.
+        nr_only_positions = [
+            index for index, (kind, _descriptor) in enumerate(classified)
+            if kind == "nrca"
+        ]
+        if len(nr_only_positions) > 1:
+            primary = max(
+                nr_only_positions,
+                key=lambda index: classified[index][1].combo_count,
+            )
+            classified = [
+                (("nrdc" if index in nr_only_positions and index != primary else kind), descriptor)
+                for index, (kind, descriptor) in enumerate(classified)
+            ]
     if table_kind == "all":
         selected = [
             item for item in classified if item[0] in ("endc", "nrca", "nrdc")
@@ -1252,7 +1547,7 @@ def parse_tables(
             path,
             data,
             descriptor,
-            discovery="automatic",
+            discovery=discovery_mode,
             table_kind=kind,
             detected_table_count=len(descriptors),
             embedded_path=embedded_path,

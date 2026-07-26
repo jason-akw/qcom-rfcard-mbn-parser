@@ -40,7 +40,7 @@ MODERN_RE = re.compile(
     re.IGNORECASE,
 )
 LEGACY_RE = re.compile(
-    r"^(?P<hwid>\d+)_(?P<fsid>\d+)_(?P<bid>\d+)\.mbn$",
+    r"^(?P<hwid>[0-9A-F]+)_(?P<fsid>[0-9A-F]+)_(?P<bid>[0-9A-F]+)\.mbn$",
     re.IGNORECASE,
 )
 TABLE_DISPLAY = {
@@ -71,11 +71,26 @@ class ModuleRecord:
 
     @property
     def identity(self) -> str:
-        return f"{self.hwid}_{self.fsid}_{self.bid}"
+        # Preserve the firmware's literal identity spelling (for example
+        # Samsung ``847_a_0``) instead of rewriting hexadecimal tokens.
+        stem = Path(self.name).stem
+        if stem.lower().startswith("rf_config_"):
+            stem = stem[len("rf_config_"):]
+        return stem
 
 
 class ToolError(RuntimeError):
     pass
+
+
+def _parse_identity_token(token: str) -> int:
+    """Parse decimal IDs while accepting hexadecimal alphabetic tokens.
+
+    Qualcomm/Samsung legacy filenames can use tokens such as ``a`` for 0xA.
+    Purely numeric tokens retain the historical decimal interpretation.
+    """
+    base = 16 if any(character.isalpha() for character in token) else 10
+    return int(token, base)
 
 
 def _matches_candidate(name: str) -> tuple[str, re.Match[str]] | None:
@@ -124,9 +139,9 @@ def scan_source(path: Path) -> list[ModuleRecord]:
             name=path.name,
             generation=generation,
             size=path.stat().st_size,
-            hwid=int(match.group("hwid")),
-            fsid=int(match.group("fsid")),
-            bid=int(match.group("bid")),
+            hwid=_parse_identity_token(match.group("hwid")),
+            fsid=_parse_identity_token(match.group("fsid")),
+            bid=_parse_identity_token(match.group("bid")),
             external=True,
             source_path=str(path.resolve()),
             sha256=digest,
@@ -139,9 +154,9 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                     name=path.name,
                     generation=generation,
                     size=path.stat().st_size,
-                    hwid=int(match.group("hwid")),
-                    fsid=int(match.group("fsid")),
-                    bid=int(match.group("bid")),
+                    hwid=_parse_identity_token(match.group("hwid")),
+                    fsid=_parse_identity_token(match.group("fsid")),
+                    bid=_parse_identity_token(match.group("bid")),
                     external=True,
                     source_path=str(path.resolve()),
                     sha256=digest,
@@ -182,9 +197,9 @@ def scan_source(path: Path) -> list[ModuleRecord]:
             name=entry.name,
             generation=generation,
             size=entry.size,
-            hwid=int(match.group("hwid")),
-            fsid=int(match.group("fsid")),
-            bid=int(match.group("bid")),
+            hwid=_parse_identity_token(match.group("hwid")),
+            fsid=_parse_identity_token(match.group("fsid")),
+            bid=_parse_identity_token(match.group("bid")),
             source_path=str(path.resolve()),
             sha256=digest,
         )
@@ -195,9 +210,9 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                 name=entry.name,
                 generation=generation,
                 size=entry.size,
-                hwid=int(match.group("hwid")),
-                fsid=int(match.group("fsid")),
-                bid=int(match.group("bid")),
+                hwid=_parse_identity_token(match.group("hwid")),
+                fsid=_parse_identity_token(match.group("fsid")),
+                bid=_parse_identity_token(match.group("bid")),
                 source_path=str(path.resolve()),
                 sha256=digest,
                 lte_combos=lte,
@@ -242,9 +257,9 @@ def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleR
             name=mbn_path.name,
             generation=generation,
             size=mbn_path.stat().st_size,
-            hwid=int(match.group("hwid")),
-            fsid=int(match.group("fsid")),
-            bid=int(match.group("bid")),
+            hwid=_parse_identity_token(match.group("hwid")),
+            fsid=_parse_identity_token(match.group("fsid")),
+            bid=_parse_identity_token(match.group("bid")),
             external=True,
             source_path=str(mbn_path.resolve()),
             sidecars=sidecars,
@@ -257,9 +272,9 @@ def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleR
                 name=mbn_path.name,
                 generation=generation,
                 size=mbn_path.stat().st_size,
-                hwid=int(match.group("hwid")),
-                fsid=int(match.group("fsid")),
-                bid=int(match.group("bid")),
+                hwid=_parse_identity_token(match.group("hwid")),
+                fsid=_parse_identity_token(match.group("fsid")),
+                bid=_parse_identity_token(match.group("bid")),
                 external=True,
                 source_path=str(mbn_path.resolve()),
                 sidecars=sidecars,
