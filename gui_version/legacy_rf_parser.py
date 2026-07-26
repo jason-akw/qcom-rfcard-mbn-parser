@@ -706,25 +706,54 @@ def infer_band_group_layout(
     antenna_count: int,
     *,
     default_later: bool,
+    count_byte_offset: int,
 ) -> str:
-    """Infer the 12-byte band-group bit packing independently of combo layout.
+    """Infer band-group packing independently of combo-record layout.
 
-    Combo-record size and band-group packing evolved independently.  In
-    particular, Samsung Waipio/X65 modules can use 40-byte combo records with
-    the later full UL-class/extended-antenna band-group packing.
+    Three 12-byte layouts are currently known:
 
-    The later layout is considered proven when a group contains a plausible
-    multi-bit UL class that tracks the DL class, or when word 3 extends a valid
-    UL antenna enum beyond three bits.  Otherwise the caller's generation hint
-    is retained.
+    ``x70_legacy_12``
+        word1 bit 6 is a one-bit UL-present flag.
+
+    ``later_generated_12``
+        word1 bits 6..10 hold the full UL class; DL antenna starts at word2
+        bit 6; UL antenna starts at word2 bit 13 and extends into word3.
+
+    ``native_aligned_12``
+        A related native layout places the full UL class at word1 bit 7,
+        DL antenna at word2 bit 7, and UL antenna at word2 bit 14 with
+        continuation in word3 bits 0..4. This layout occurs in Meizu X75 and
+        several Sony/Xperia modules, so it must not be selected by OEM or by
+        the combo-count byte alone.
+
+    The strongest discriminator is semantic rather than OEM-specific:
+    bandwidth class A represents one component carrier, therefore its antenna
+    enum must resolve to a one-element antenna pattern. Decoding a native-
+    aligned table with the later-generated shifts produces doubled enum
+    indexes and multi-element patterns for essentially every class-A group.
     """
     if group_size != 12:
         return "compact_8"
 
-    if default_later:
-        return "later_generated_12"
+    usable = 0
+    native_all_valid = True
+    native_nonzero_ul = 0
 
-    strong_later_evidence = 0
+    class_a_groups = 0
+    later_class_a_shape_errors = 0
+    native_class_a_shape_errors = 0
+
+    later_evidence = 0
+    native_prefix_word1_set = 0
+    native_prefix_word2_set = 0
+
+    def antenna_component_count(index: int) -> int | None:
+        if not 0 <= index < antenna_count:
+            return None
+        if not 0 <= index < len(ANTENNA_TABLE):
+            return None
+        return sum(1 for value in ANTENNA_TABLE[index] if value)
+
     for index in range(band_group_count):
         offset = groups_offset + index * group_size
         try:
@@ -732,37 +761,96 @@ def infer_band_group_layout(
         except struct.error:
             break
 
+        rat_id = words[0] & 0x3
+        band = (words[0] >> 2) & 0x1FF
+        if rat_id not in (1, 2) or not 1 <= band <= 511:
+            continue
+        usable += 1
+
         dl_class = words[0] >> 11
-        ul_class_candidate = (words[1] >> 6) & 0x1F
-        old_ul_antenna = (words[2] >> 13) & 0x07
-        extended_ul_antenna = (
-            old_ul_antenna | ((words[3] & 0x0F) << 3)
+
+        later_ul_class = (words[1] >> 6) & 0x1F
+        later_dl_ant = (words[2] >> 6) & 0x7F
+        later_ul_ant = (
+            ((words[2] >> 13) & 0x07)
+            | ((words[3] & 0x0F) << 3)
         )
 
-        # Strong example found in Samsung 847_a_0:
-        # DL G/H/I pairs with UL G/H/I.  The old one-bit interpretation would
-        # collapse these to A/absent.
-        if (
-            2 <= ul_class_candidate <= 26
-            and ul_class_candidate == dl_class
-        ):
-            strong_later_evidence += 1
+        native_ul_class = (words[1] >> 7) & 0x1F
+        native_dl_ant = (words[2] >> 7) & 0x7F
+        native_ul_ant = (
+            ((words[2] >> 14) & 0x03)
+            | ((words[3] & 0x1F) << 2)
+        )
 
-        # A non-zero extension nibble that creates a valid antenna enum is also
-        # direct evidence of the later packing.
+        native_prefix_word1_set += (words[1] >> 6) & 1
+        native_prefix_word2_set += (words[2] >> 6) & 1
+
+        if native_ul_class:
+            native_nonzero_ul += 1
+
+        if (
+            native_ul_class > 26
+            or native_dl_ant >= antenna_count
+            or native_ul_ant >= antenna_count
+        ):
+            native_all_valid = False
+
+        # Class A is a one-CC class. The selected antenna enum must therefore
+        # resolve to exactly one antenna-pattern element. This catches the
+        # characteristic 2x enum-index error without relying on OEM names,
+        # combo size, descriptor size, or count-byte location.
+        if dl_class == 1:
+            class_a_groups += 1
+            later_count = antenna_component_count(later_dl_ant)
+            native_count = antenna_component_count(native_dl_ant)
+            if later_count != 1:
+                later_class_a_shape_errors += 1
+            if native_count != 1:
+                native_class_a_shape_errors += 1
+
+        # Positive evidence for the Sony/Samsung generated layout.
+        if (
+            2 <= later_ul_class <= 26
+            and later_ul_class == dl_class
+        ):
+            later_evidence += 1
         if (
             (words[3] & 0x0F) != 0
-            and extended_ul_antenna != old_ul_antenna
-            and extended_ul_antenna < antenna_count
+            and later_ul_ant < antenna_count
+            and later_ul_ant != ((words[2] >> 13) & 0x07)
         ):
-            strong_later_evidence += 1
+            later_evidence += 1
 
-    return (
-        "later_generated_12"
-        if strong_later_evidence
-        else "x70_legacy_12"
-    )
+    # Strong native-aligned fingerprint:
+    # - the native fields remain in range;
+    # - class-A groups decode as one-element antenna patterns;
+    # - the later-generated shifts fail that same invariant for most groups.
+    min_bad = max(4, (class_a_groups * 3) // 4)
+    if (
+        usable >= 8
+        and native_all_valid
+        and class_a_groups >= 4
+        and native_class_a_shape_errors == 0
+        and later_class_a_shape_errors >= min_bad
+    ):
+        return "native_aligned_12"
 
+    # Compatibility fallback for a native table with too few class-A groups.
+    # Count-at-+26 remains only a weak hint and is not required.
+    if (
+        usable >= 8
+        and native_all_valid
+        and native_nonzero_ul >= 4
+        and native_prefix_word2_set == 0
+        and native_prefix_word1_set <= max(4, usable // 20)
+        and count_byte_offset == 26
+    ):
+        return "native_aligned_12"
+
+    if later_evidence or default_later:
+        return "later_generated_12"
+    return "x70_legacy_12"
 
 def validate_candidate(
     data: bytes,
@@ -845,9 +933,13 @@ def validate_candidate(
         )
         if not exhaustive:
             provisional_group_layout = (
-                "later_generated_12"
-                if default_later
-                else "x70_legacy_12"
+                "native_aligned_12"
+                if selected_count_offset == 26
+                else (
+                    "later_generated_12"
+                    if default_later
+                    else "x70_legacy_12"
+                )
             )
             return (combo_count, combos_offset, groups_offset, antenna_count,
                     highest_group, selected_count_offset, combo_size, group_size,
@@ -864,6 +956,7 @@ def validate_candidate(
             group_size,
             antenna_count,
             default_later=default_later,
+            count_byte_offset=selected_count_offset,
         )
 
         valid_groups = True
@@ -879,16 +972,23 @@ def validate_candidate(
             if rat_id not in (1, 2) or not 1 <= band <= 511:
                 valid_groups = False
                 break
-            dl_antenna_index = (words16[2] >> 6) & 0x7F
-            if band_group_layout == "later_generated_12":
-                # Later generated packing continues the UL antenna enum into
-                # the low nibble of word 3.
+            if band_group_layout == "native_aligned_12":
+                dl_antenna_index = (words16[2] >> 7) & 0x7F
                 ul_antenna_index = (
-                    ((words16[2] >> 13) & 0x7)
-                    | ((words16[3] & 0xF) << 3)
+                    ((words16[2] >> 14) & 0x03)
+                    | ((words16[3] & 0x1F) << 2)
                 )
             else:
-                ul_antenna_index = (words16[2] >> 13) & 0x7
+                dl_antenna_index = (words16[2] >> 6) & 0x7F
+                if band_group_layout == "later_generated_12":
+                    # Later generated packing continues the UL antenna enum
+                    # into the low nibble of word 3.
+                    ul_antenna_index = (
+                        ((words16[2] >> 13) & 0x7)
+                        | ((words16[3] & 0xF) << 3)
+                    )
+                else:
+                    ul_antenna_index = (words16[2] >> 13) & 0x7
             if dl_antenna_index >= antenna_count or ul_antenna_index >= antenna_count:
                 valid_groups = False
                 break
@@ -945,27 +1045,39 @@ def find_named_descriptors(
         seen_offsets.add(symbol.file_offset)
 
     # Band-group packing is a property of the shared group table, not of an
-    # individual combo descriptor. If any table proves the later packing,
-    # propagate it to every descriptor that references the same groups VA.
-    later_group_vas = {
-        descriptor.band_groups_va
-        for _kind, descriptor, _name in found
-        if descriptor.band_group_layout == "later_generated_12"
+    # individual combo descriptor. Propagate the strongest proven layout to
+    # every descriptor that references the same group-table VA.
+    group_layout_by_va: dict[int, str] = {}
+    layout_priority = {
+        "x70_legacy_12": 0,
+        "later_generated_12": 1,
+        "native_aligned_12": 2,
     }
-    if later_group_vas:
-        found = [
-            (
-                kind,
-                replace(
-                    descriptor,
-                    band_group_layout="later_generated_12",
-                )
-                if descriptor.band_groups_va in later_group_vas
-                else descriptor,
-                symbol_name,
+    for _kind, descriptor, _name in found:
+        current = group_layout_by_va.get(descriptor.band_groups_va)
+        if (
+            current is None
+            or layout_priority.get(descriptor.band_group_layout, 0)
+            > layout_priority.get(current, 0)
+        ):
+            group_layout_by_va[descriptor.band_groups_va] = (
+                descriptor.band_group_layout
             )
-            for kind, descriptor, symbol_name in found
-        ]
+
+    found = [
+        (
+            kind,
+            replace(
+                descriptor,
+                band_group_layout=group_layout_by_va.get(
+                    descriptor.band_groups_va,
+                    descriptor.band_group_layout,
+                ),
+            ),
+            symbol_name,
+        )
+        for kind, descriptor, symbol_name in found
+    ]
 
     order = {"endc": 0, "nrca": 1, "nrdc": 2}
     found.sort(
@@ -1132,38 +1244,51 @@ def parse_band_group(data: bytes, descriptor: Descriptor, index: int) -> dict[st
 
     dl_bw_code = words[1] & 0x3F
 
-    # Qualcomm used two related 12-byte band-group packings.
+    # Qualcomm used at least three related 12-byte band-group packings.
     #
-    # X70 legacy packing:
+    # X70 legacy:
     #   word1 bit 6      = UL present
-    #   word2 bits 13-15 = 3-bit UL antenna enum
+    #   word2 bits 6..12 = DL antenna enum
+    #   word2 bits 13..15 = UL antenna enum
     #
-    # Later generated/X75/Sony packing:
-    #   word1 bits 6-10  = full 5-bit UL bandwidth class
-    #   word2 bits 13-15 = low 3 bits of UL antenna enum
-    #   word3 bits 0-3   = high 4 bits of UL antenna enum
+    # Sony/Samsung later generated:
+    #   word1 bits 6..10 = full UL bandwidth class
+    #   word2 bits 6..12 = DL antenna enum
+    #   word2 bits 13..15 + word3 bits 0..3 = UL antenna enum
     #
-    # The later layout is used by 44-byte generated records and by the known
-    # X75 count-at-+26 revision.
-    later_packed = descriptor.band_group_layout == "later_generated_12"
-    if later_packed:
+    # Native aligned:
+    #   word1 bit 6      = alignment/reserved
+    #   word1 bits 7..11 = full UL bandwidth class
+    #   word2 bit 6      = alignment/reserved
+    #   word2 bits 7..13 = DL antenna enum
+    #   word2 bits 14..15 + word3 bits 0..4 = UL antenna enum
+    layout = descriptor.band_group_layout
+    if layout == "native_aligned_12":
+        ul_bw_class_code = (words[1] >> 7) & 0x1F
+        ul_present = ul_bw_class_code != 0
+        field_2_unknown_high = words[1] >> 12
+        dl_antenna_index = (words[2] >> 7) & 0x7F
+        ul_antenna_index = (
+            ((words[2] >> 14) & 0x03)
+            | ((words[3] & 0x1F) << 2)
+        )
+    elif layout == "later_generated_12":
         ul_bw_class_code = (words[1] >> 6) & 0x1F
         ul_present = ul_bw_class_code != 0
         field_2_unknown_high = words[1] >> 11
+        dl_antenna_index = (words[2] >> 6) & 0x7F
+        ul_antenna_index = (
+            ((words[2] >> 13) & 0x07)
+            | ((words[3] & 0x0F) << 3)
+        )
     else:
         ul_present = bool((words[1] >> 6) & 1)
         ul_bw_class_code = 1 if ul_present else 0
         field_2_unknown_high = words[1] >> 7
+        dl_antenna_index = (words[2] >> 6) & 0x7F
+        ul_antenna_index = (words[2] >> 13) & 0x07
 
     ul_bw_code = words[2] & 0x3F
-    dl_antenna_index = (words[2] >> 6) & 0x7F
-    if later_packed:
-        ul_antenna_index = (
-            ((words[2] >> 13) & 0x7)
-            | ((words[3] & 0xF) << 3)
-        )
-    else:
-        ul_antenna_index = (words[2] >> 13) & 0x7
     dl_pattern, dl_antenna_name = antenna_info(dl_antenna_index)
     ul_pattern, ul_antenna_name = antenna_info(ul_antenna_index)
 
@@ -1191,6 +1316,27 @@ def parse_band_group(data: bytes, descriptor: Descriptor, index: int) -> dict[st
         "ul_bw_class": bandwidth_class_label(ul_bw_class_code),
         "band_group_layout": descriptor.band_group_layout,
         "field_2_unknown_high": field_2_unknown_high,
+        "native_word1_prefix_bit": (
+            (words[1] >> 6) & 1
+            if layout == "native_aligned_12"
+            else None
+        ),
+        "native_word2_prefix_bit": (
+            (words[2] >> 6) & 1
+            if layout == "native_aligned_12"
+            else None
+        ),
+        # Backward-compatible aliases from parser v5.
+        "x75_word1_alignment_bit": (
+            (words[1] >> 6) & 1
+            if layout == "native_aligned_12"
+            else None
+        ),
+        "x75_word2_alignment_bit": (
+            (words[2] >> 6) & 1
+            if layout == "native_aligned_12"
+            else None
+        ),
         "ul_bw_code": ul_bw_code,
         "ul_bandwidth": bandwidth_label(ul_bw_code),
         "ul_bandwidth_parts_mhz": bandwidth_parts(ul_bw_code),
@@ -1410,6 +1556,7 @@ def parse_descriptor(
                 "Some rare Qualcomm bandwidth-index mappings are inferred.",
                 "BC_ID is not stored in these hardware RF source records.",
                 "Combination-property bits 0..2 are power class; bits 6..7 are UL TX switching.",
+                "X75-native band groups use one-bit-aligned UL-class and antenna fields.",
                 "Later generated band groups store UL class in word1 bits 6..10 and extend the UL antenna enum into word3 bits 0..3.",
                 "DL bandwidth class uses the high five bits of band_code.",
                 "B826 repacks these source records; it is not a byte-for-byte copy.",

@@ -9,6 +9,8 @@ This module contains all non-GUI work used by ``qualcomm_rf_combo_gui.py``:
 * writing MBN, JSON, CSV, 0xB0CD, and 0xB826 exports; and
 * comparing multiple RF-card MBNs.
 
+This revision consumes dynamically selected native-aligned and later-generated band-group fields from legacy parser v1.7.0.
+
 Keep this file beside ``legacy_rf_parser.py`` and
 ``modern_rfcard_parser.py``.
 """
@@ -34,7 +36,7 @@ import new_rfcard_parser as modern
 # the legacy implementation directly.
 ParseError = legacy.ParseError
 
-VERSION = "1.5.0"
+VERSION = "1.7.0"
 MODERN_RE = re.compile(
     r"^rf_config_(?P<hwid>\d+)_(?P<fsid>\d+)_(?P<bid>\d+)\.mbn$",
     re.IGNORECASE,
