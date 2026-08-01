@@ -36,13 +36,14 @@ import new_rfcard_parser as modern
 # the legacy implementation directly.
 ParseError = legacy.ParseError
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 MODERN_RE = re.compile(
     r"^rf_config_(?P<hwid>\d+)_(?P<fsid>\d+)_(?P<bid>\d+)\.mbn$",
     re.IGNORECASE,
 )
 LEGACY_RE = re.compile(
-    r"^(?P<hwid>[0-9A-F]+)_(?P<fsid>[0-9A-F]+)_(?P<bid>[0-9A-F]+)\.mbn$",
+    r"^(?P<hwid>[0-9A-F]+)_(?P<fsid>[0-9A-F]+)"
+    r"(?:_(?P<bid>[0-9A-F]+))?\.mbn$",
     re.IGNORECASE,
 )
 TABLE_DISPLAY = {
@@ -95,6 +96,11 @@ def _parse_identity_token(token: str) -> int:
     return int(token, base)
 
 
+def _identity_value(match: re.Match[str], field: str) -> int:
+    token = match.groupdict().get(field)
+    return _parse_identity_token(token) if token is not None else 0
+
+
 def _matches_candidate(name: str) -> tuple[str, re.Match[str]] | None:
     match = MODERN_RE.fullmatch(name)
     if match:
@@ -141,9 +147,9 @@ def scan_source(path: Path) -> list[ModuleRecord]:
             name=path.name,
             generation=generation,
             size=path.stat().st_size,
-            hwid=_parse_identity_token(match.group("hwid")),
-            fsid=_parse_identity_token(match.group("fsid")),
-            bid=_parse_identity_token(match.group("bid")),
+            hwid=_identity_value(match, "hwid"),
+            fsid=_identity_value(match, "fsid"),
+            bid=_identity_value(match, "bid"),
             external=True,
             source_path=str(path.resolve()),
             sha256=digest,
@@ -156,9 +162,9 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                     name=path.name,
                     generation=generation,
                     size=path.stat().st_size,
-                    hwid=_parse_identity_token(match.group("hwid")),
-                    fsid=_parse_identity_token(match.group("fsid")),
-                    bid=_parse_identity_token(match.group("bid")),
+                    hwid=_identity_value(match, "hwid"),
+                    fsid=_identity_value(match, "fsid"),
+                    bid=_identity_value(match, "bid"),
                     external=True,
                     source_path=str(path.resolve()),
                     sha256=digest,
@@ -199,9 +205,9 @@ def scan_source(path: Path) -> list[ModuleRecord]:
             name=entry.name,
             generation=generation,
             size=entry.size,
-            hwid=_parse_identity_token(match.group("hwid")),
-            fsid=_parse_identity_token(match.group("fsid")),
-            bid=_parse_identity_token(match.group("bid")),
+            hwid=_identity_value(match, "hwid"),
+            fsid=_identity_value(match, "fsid"),
+            bid=_identity_value(match, "bid"),
             source_path=str(path.resolve()),
             sha256=digest,
         )
@@ -212,9 +218,9 @@ def scan_source(path: Path) -> list[ModuleRecord]:
                 name=entry.name,
                 generation=generation,
                 size=entry.size,
-                hwid=_parse_identity_token(match.group("hwid")),
-                fsid=_parse_identity_token(match.group("fsid")),
-                bid=_parse_identity_token(match.group("bid")),
+                hwid=_identity_value(match, "hwid"),
+                fsid=_identity_value(match, "fsid"),
+                bid=_identity_value(match, "bid"),
                 source_path=str(path.resolve()),
                 sha256=digest,
                 lte_combos=lte,
@@ -259,9 +265,9 @@ def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleR
             name=mbn_path.name,
             generation=generation,
             size=mbn_path.stat().st_size,
-            hwid=_parse_identity_token(match.group("hwid")),
-            fsid=_parse_identity_token(match.group("fsid")),
-            bid=_parse_identity_token(match.group("bid")),
+            hwid=_identity_value(match, "hwid"),
+            fsid=_identity_value(match, "fsid"),
+            bid=_identity_value(match, "bid"),
             external=True,
             source_path=str(mbn_path.resolve()),
             sidecars=sidecars,
@@ -274,9 +280,9 @@ def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleR
                 name=mbn_path.name,
                 generation=generation,
                 size=mbn_path.stat().st_size,
-                hwid=_parse_identity_token(match.group("hwid")),
-                fsid=_parse_identity_token(match.group("fsid")),
-                bid=_parse_identity_token(match.group("bid")),
+                hwid=_identity_value(match, "hwid"),
+                fsid=_identity_value(match, "fsid"),
+                bid=_identity_value(match, "bid"),
                 external=True,
                 source_path=str(mbn_path.resolve()),
                 sidecars=sidecars,
@@ -725,8 +731,8 @@ def _find_legacy_lte_array(
 ) -> tuple[int, int, int] | None:
     """Find the older 50-byte LTE info-per-band array and its descriptor.
 
-    Older RF cards keep LTE CA outside the shared 40-byte NR/EN-DC descriptor
-    layout.  The descriptor begins with ``uint32 count`` and ``uint32 VA``;
+    Older RF cards keep LTE CA outside the shared NR/EN-DC descriptor layout.
+    The descriptor begins with ``uint16 count``, padding, and ``uint32 VA``;
     each referenced record is a two-byte prefix followed by six packed
     eight-byte LTE components.
     """
@@ -770,6 +776,37 @@ def _find_legacy_lte_array(
             if not 1 <= populated <= 6:
                 return False
         return True
+
+    # Generated public symbols are authoritative.  Structural scanning can
+    # otherwise mistake a smaller integer elsewhere in a large card (notably
+    # HWID 700) for a second count that points at the same LTE array.
+    named_candidates: dict[tuple[int, int], tuple[int, int, int]] = {}
+    suffix = "_lte_combos_info_table_sub_cap_high"
+    for symbol in image.dynamic_symbols():
+        name = symbol.name.lower()
+        if (
+            symbol.file_offset is None
+            or "internal" in name
+            or not name.endswith(suffix)
+        ):
+            continue
+        count = struct.unpack_from("<H", blob, symbol.file_offset)[0]
+        records_va = struct.unpack_from("<I", blob, symbol.file_offset + 4)[0]
+        records_offset = image.va_to_offset(records_va, count * 50)
+        if records_offset is None or not validate_array(count, records_offset):
+            continue
+        named_candidates.setdefault(
+            (records_offset, count),
+            (symbol.file_offset, records_offset, count),
+        )
+    if len(named_candidates) == 1:
+        return next(iter(named_candidates.values()))
+    if len(named_candidates) > 1:
+        details = ", ".join(
+            f"0x{item[0]:X}->{item[2]} records at 0x{item[1]:X}"
+            for item in named_candidates.values()
+        )
+        raise ToolError(f"Ambiguous named legacy LTE CA arrays: {details}")
 
     candidates: list[tuple[int, int, int]] = []
     for range_start, range_end in image.mapped_file_ranges():
@@ -893,9 +930,16 @@ def _parse_legacy_lte_array(
 
 def parse_legacy(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
     image = legacy.Elf32Image(blob)
-    descriptors = legacy.find_descriptors(blob, image)
+    card_name = legacy.rfcard_name_from_symbols(image)
+    lte_result = _parse_legacy_lte_array(record, blob, image)
+    try:
+        descriptors = legacy.find_descriptors(blob, image)
+    except legacy.ParseError:
+        if card_name is None:
+            raise
+        descriptors = []
     labeled = _legacy_table_labels(blob, descriptors)
-    if not labeled:
+    if not labeled and lte_result is None and card_name is None:
         raise ToolError("No LTE/NR RF-combination descriptors were classified")
 
     parsed: list[tuple[str, dict[str, Any]]] = []
@@ -903,7 +947,6 @@ def parse_legacy(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
     components: list[dict[str, Any]] = []
     inference_notes: list[str] = []
 
-    lte_result = _parse_legacy_lte_array(record, blob, image)
     if lte_result is not None:
         parsed.append(("lte_ca", lte_result))
 
@@ -1047,6 +1090,21 @@ def parse_legacy(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
             "generation": record.generation,
             "module": asdict(record),
             "module_sha256": hashlib.sha256(blob).hexdigest(),
+            "rfcard": {
+                "name": card_name,
+                "name_source": (
+                    "ELF dynamic symbol" if card_name is not None else None
+                ),
+                "canonical_xml_variant_name": None,
+                "canonical_xml_variant_name_embedded": False,
+                "hwid": record.hwid,
+                "fsid": record.fsid,
+                "bid": record.bid,
+                "key": record.identity,
+                "res_dat_path": None,
+                "environment_name_high": None,
+                "environment_name_low": None,
+            },
             "descriptor_count": len(descriptors),
             "classification_notes": inference_notes,
             "diag_note": (
@@ -1134,15 +1192,21 @@ def _combo_counts(
     logger = logging.getLogger(__name__)
 
     try:
-        if record.generation in {"Legacy ELF", "legacy"} or blob.startswith(b"\\x7fELF"):
+        if record.generation in {"Legacy ELF", "legacy"}:
             image = legacy.Elf32Image(blob)
+            card_name = legacy.rfcard_name_from_symbols(image)
 
             # LTE CA is stored separately from the NR/EN-DC descriptor tables
             # on these generated legacy RF-card modules.
             lte_found = _find_legacy_lte_array(blob, image)
             lte = lte_found[2] if lte_found is not None else 0
 
-            descriptors = legacy.find_descriptors(blob, image)
+            try:
+                descriptors = legacy.find_descriptors(blob, image)
+            except legacy.ParseError:
+                if card_name is not None:
+                    return lte, "0+0+0=0"
+                raise
             labeled = _legacy_table_labels(blob, descriptors)
 
             endc = sum(

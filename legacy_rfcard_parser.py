@@ -48,6 +48,11 @@ LEGACY_COMBO_RECORD_SIZE = 40
 LEGACY_BAND_GROUP_RECORD_SIZE = 12
 MODERN_COMBO_RECORD_SIZE = 44
 MODERN_BAND_GROUP_RECORD_SIZE = 12
+HI_INLINE_COMBO_RECORD_SIZE = 100
+HI_INLINE_BAND_GROUP_RECORD_SIZE = 8
+HI_INLINE_MAX_COMPONENTS = 12
+HI_INLINE_PROPERTY_OFFSET = 96
+HI_INLINE_COUNT_OFFSET = 98
 MAX_GROUPS_PER_COMBO = 12
 UNUSED_GROUP_INDEX = 0xFFFF
 
@@ -859,9 +864,114 @@ def validate_candidate(
     *,
     exhaustive: bool,
 ) -> tuple[int, int, int, int, int, int, int, int, str, str, int | None] | None:
-    """Validate either the legacy 40/12-byte layout or Xperia 44/8-byte layout."""
+    """Validate a known RF combination descriptor layout."""
     if descriptor_offset < 0 or descriptor_offset + 20 > len(data):
         return None
+
+    # Earlier MPSS.HI cards store every NR/EN-DC band component directly in a
+    # 100-byte combination record instead of referencing a shared band-group
+    # table.  The 24-byte descriptor mirrors the legacy LTE descriptor:
+    #
+    #   uint16 count; pad; pointer records; uint16 antenna_count; ...
+    #
+    # Record bytes 0..95 are twelve packed eight-byte components; +96 is the
+    # property byte, +98 is the active component count, and +99 is BCS.
+    if descriptor_offset + 24 <= len(data):
+        inline_count, inline_padding = struct.unpack_from(
+            "<HH", data, descriptor_offset
+        )
+        inline_records_va = struct.unpack_from(
+            "<I", data, descriptor_offset + 4
+        )[0]
+        inline_antenna_count = struct.unpack_from(
+            "<H", data, descriptor_offset + 8
+        )[0]
+        inline_records_offset = image.va_to_offset(
+            inline_records_va,
+            inline_count * HI_INLINE_COMBO_RECORD_SIZE,
+        )
+        if (
+            1 <= inline_count <= 100_000
+            and inline_padding == 0
+            and 1 <= inline_antenna_count <= 512
+            and inline_records_offset is not None
+        ):
+            if exhaustive:
+                inline_indices: Sequence[int] = range(inline_count)
+            else:
+                inline_indices = sorted(
+                    index
+                    for index in {
+                        0,
+                        1,
+                        inline_count // 4,
+                        inline_count // 2,
+                        inline_count - 1,
+                    }
+                    if 0 <= index < inline_count
+                )
+
+            inline_valid = True
+            for combo_index in inline_indices:
+                record_offset = (
+                    inline_records_offset
+                    + combo_index * HI_INLINE_COMBO_RECORD_SIZE
+                )
+                num_entries = data[record_offset + HI_INLINE_COUNT_OFFSET]
+                if not 1 <= num_entries <= HI_INLINE_MAX_COMPONENTS:
+                    inline_valid = False
+                    break
+                for component_index in range(HI_INLINE_MAX_COMPONENTS):
+                    component_offset = (
+                        record_offset
+                        + component_index * HI_INLINE_BAND_GROUP_RECORD_SIZE
+                    )
+                    component = data[
+                        component_offset:
+                        component_offset + HI_INLINE_BAND_GROUP_RECORD_SIZE
+                    ]
+                    if component_index >= num_entries:
+                        if any(component):
+                            inline_valid = False
+                            break
+                        continue
+                    band_code = struct.unpack_from("<H", component)[0]
+                    rat_id = band_code & 0x3
+                    band = (band_code >> 2) & 0x1FF
+                    dl_class = band_code >> 11
+                    if (
+                        not any(component)
+                        or rat_id not in (1, 2)
+                        or not 1 <= band <= 511
+                        or not 1 <= dl_class <= 26
+                    ):
+                        inline_valid = False
+                        break
+                if not inline_valid:
+                    break
+
+            if inline_valid:
+                antenna_table_va = struct.unpack_from(
+                    "<I", data, descriptor_offset + 12
+                )[0]
+                if (
+                    antenna_table_va == 0
+                    or image.va_to_offset(antenna_table_va, 1) is None
+                ):
+                    antenna_table_va = None
+                return (
+                    inline_count,
+                    inline_records_offset,
+                    0,
+                    inline_antenna_count,
+                    -1,
+                    HI_INLINE_COUNT_OFFSET,
+                    HI_INLINE_COMBO_RECORD_SIZE,
+                    HI_INLINE_BAND_GROUP_RECORD_SIZE,
+                    "hi_inline_100",
+                    "compact_8",
+                    antenna_table_va,
+                )
 
     words = struct.unpack_from("<5I", data, descriptor_offset)
     combo_count, combos_va, groups_va = words[:3]
@@ -1005,6 +1115,44 @@ NAMED_COMBO_TABLE_SUFFIXES = (
 )
 
 
+def rfcard_name_from_symbols(image: Elf32Image) -> str | None:
+    """Recover the generated RFCard name from ELF dynamic symbols."""
+    symbols = image.dynamic_symbols()
+    public_suffixes = (
+        "lte_combos_info_table_sub_cap_high",
+        "nr5g_nr5g_combos_info_table_sub_cap_high",
+        "lte_nr5g_combos_info_table_sub_cap_high",
+        "nr5g_combos_info_table_sub_cap_high",
+    )
+    for suffix in public_suffixes:
+        candidates = sorted(
+            symbol.name
+            for symbol in symbols
+            if symbol.name.lower().endswith(suffix)
+            and "internal" not in symbol.name.lower()
+        )
+        if candidates:
+            return candidates[0][:-len(suffix)].rstrip("_")
+
+    generated_names = sorted(
+        symbol.name
+        for symbol in symbols
+        if symbol.name.lower().startswith("rfc_hwid")
+    )
+    if not generated_names:
+        return None
+    common_prefix = generated_names[0]
+    for name in generated_names[1:]:
+        limit = min(len(common_prefix), len(name))
+        index = 0
+        while index < limit and common_prefix[index] == name[index]:
+            index += 1
+        common_prefix = common_prefix[:index]
+        if not common_prefix:
+            return None
+    return common_prefix.rstrip("_") or None
+
+
 def find_named_descriptors(
     data: bytes,
     image: Elf32Image,
@@ -1130,6 +1278,26 @@ def descriptor_rat_signatures(
 ) -> set[frozenset[int]]:
     """Return the RAT set used by each kind of combination in a table."""
     signatures: set[frozenset[int]] = set()
+    if descriptor.descriptor_layout == "hi_inline_100":
+        for combo_index in range(descriptor.combo_count):
+            offset = (
+                descriptor.combos_file_offset
+                + combo_index * descriptor.combo_record_size
+            )
+            num_entries = data[offset + descriptor.count_byte_offset]
+            rats = {
+                struct.unpack_from(
+                    "<H",
+                    data,
+                    offset
+                    + component_index * descriptor.band_group_record_size,
+                )[0]
+                & 0x3
+                for component_index in range(num_entries)
+            }
+            signatures.add(frozenset(rats))
+        return signatures
+
     for combo_index in range(descriptor.combo_count):
         offset = descriptor.combos_file_offset + combo_index * descriptor.combo_record_size
         group_indices, _, _, _, num_entries, _, _, _ = read_combo_header(
@@ -1209,17 +1377,29 @@ def make_descriptor(
         band_group_layout,
         antenna_table_va,
     ) = layout
-    _, combos_va, groups_va = struct.unpack_from("<3I", data, descriptor_offset)
+    if descriptor_layout == "hi_inline_100":
+        combo_count = struct.unpack_from("<H", data, descriptor_offset)[0]
+        combos_va = struct.unpack_from("<I", data, descriptor_offset + 4)[0]
+        groups_va = 0
+        groups_offset = 0
+        band_group_count = 0
+        descriptor_size = 24
+    else:
+        _, combos_va, groups_va = struct.unpack_from(
+            "<3I", data, descriptor_offset
+        )
+        band_group_count = highest_group + 1
+        descriptor_size = 20
     return Descriptor(
         file_offset=descriptor_offset,
-        virtual_address=image.offset_to_va(descriptor_offset, 20),
+        virtual_address=image.offset_to_va(descriptor_offset, descriptor_size),
         combo_count=combo_count,
         combos_va=combos_va,
         combos_file_offset=combos_offset,
         band_groups_va=groups_va,
         band_groups_file_offset=groups_offset,
         antenna_table_count=antenna_count,
-        band_group_count=highest_group + 1,
+        band_group_count=band_group_count,
         count_byte_offset=count_byte_offset,
         combo_record_size=combo_record_size,
         band_group_record_size=band_group_record_size,
@@ -1426,6 +1606,75 @@ def parse_combo(
     band_groups: Sequence[dict[str, Any]],
     combo_index: int,
 ) -> dict[str, Any]:
+    if descriptor.descriptor_layout == "hi_inline_100":
+        offset = (
+            descriptor.combos_file_offset
+            + combo_index * descriptor.combo_record_size
+        )
+        combo_flags = data[offset + HI_INLINE_PROPERTY_OFFSET]
+        reserved_byte = data[offset + HI_INLINE_PROPERTY_OFFSET + 1]
+        num_band_entries = data[offset + descriptor.count_byte_offset]
+        bcs_num = data[offset + descriptor.count_byte_offset + 1]
+        inline_descriptor = replace(
+            descriptor,
+            band_groups_file_offset=offset,
+            band_group_count=num_band_entries,
+        )
+        entries: list[dict[str, Any]] = []
+        for position in range(num_band_entries):
+            entry = parse_band_group(data, inline_descriptor, position)
+            entry["group_index"] = None
+            entry["position"] = position
+            entries.append(entry)
+
+        rats = {entry["rat"] for entry in entries}
+        if rats == {"LTE", "NR"}:
+            rat_mix = "EN-DC"
+        elif rats == {"NR"}:
+            rat_mix = "NR-CA"
+        elif rats == {"LTE"}:
+            rat_mix = "LTE-CA"
+        else:
+            rat_mix = "+".join(sorted(rats))
+        property_fields = decode_combo_property_byte(combo_flags)
+        return {
+            "combo_index": combo_index,
+            "file_offset": offset,
+            "file_offset_hex": f"0x{offset:X}",
+            "raw_hex": data[
+                offset:offset + descriptor.combo_record_size
+            ].hex(" "),
+            "rat_mix": rat_mix,
+            "combination_source_order": "+".join(
+                entry["band_label"] for entry in entries
+            ),
+            "combination_source_order_with_classes": "+".join(
+                entry["band_class_label"] for entry in entries
+            ),
+            "combination": canonical_combination(entries),
+            "combination_with_classes": canonical_combination(
+                entries, include_classes=True
+            ),
+            "group_indices": [],
+            "all_group_indices_raw": [],
+            "combo_flags": combo_flags,
+            "combo_flags_hex": f"0x{combo_flags:02X}",
+            **property_fields,
+            "bcs_num": bcs_num,
+            "higher_power_limit": None,
+            "reserved_byte_1": reserved_byte,
+            "reserved_byte_2": 0,
+            "num_band_entries": num_band_entries,
+            "reserved_word": 0,
+            "envelope_mask": 0,
+            "envelope_mask_hex": "0x00000000",
+            "subset_mask": 0,
+            "subset_mask_hex": "0x00000000",
+            "extension_word": None,
+            "extension_word_hex": None,
+            "entries": entries,
+        }
+
     offset = descriptor.combos_file_offset + combo_index * descriptor.combo_record_size
     (
         all_group_indices,
@@ -1510,10 +1759,14 @@ def parse_descriptor(
     detected_table_count: int,
     embedded_path: str | None = None,
 ) -> dict[str, Any]:
-    band_groups = [
-        parse_band_group(data, descriptor, index)
-        for index in range(descriptor.band_group_count)
-    ]
+    band_groups = (
+        []
+        if descriptor.descriptor_layout == "hi_inline_100"
+        else [
+            parse_band_group(data, descriptor, index)
+            for index in range(descriptor.band_group_count)
+        ]
+    )
     combinations = [
         parse_combo(data, descriptor, band_groups, index)
         for index in range(descriptor.combo_count)
