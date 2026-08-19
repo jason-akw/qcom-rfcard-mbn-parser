@@ -28,14 +28,12 @@ DL_COL_RE = re.compile(r"^(NR )?DL\d+$")
 # spelled (used only for auto-detection of the table kind).
 TABLE_CONFIG = {
     "lte_ca": {
-        "expr_prefix": "CA_",
-        "token_strip_prefix": "B",
+        "band_re": re.compile(r"B(\d+[A-Z])"),
         "detect": lambda header: any(h == "DL1" for h in header)
         and not any(h.startswith("NR ") for h in header),
     },
     "nr_ca": {
-        "expr_prefix": "NRCA_",
-        "token_strip_prefix": "n",
+        "band_re": re.compile(r"N(\d+[A-Z])"),
         "detect": lambda header: any(h.startswith("NR DL") for h in header),
     },
 }
@@ -92,8 +90,7 @@ def parse_rf_card(dirpath, table_kind):
         return set()
 
     cfg = TABLE_CONFIG[table_kind]
-    prefix = cfg["expr_prefix"]
-    strip_prefix = cfg["token_strip_prefix"]
+    band_re = cfg["band_re"]
 
     combos = set()
     with open(files[0], newline="", encoding="utf-8-sig") as f:
@@ -102,15 +99,11 @@ def parse_rf_card(dirpath, table_kind):
             if row.get("table") != table_kind:
                 continue
             expr = (row.get("expression") or "").strip()
-            if not expr.startswith(prefix):
+            if not expr:
                 continue
-            expr = expr[len(prefix):]
-            bands = []
-            for tok in expr.split("+"):
-                tok = tok.strip()
-                if tok.startswith(strip_prefix):
-                    tok = tok[len(strip_prefix):]
-                bands.append(tok)
+            bands = band_re.findall(expr)
+            if not bands:
+                continue
             combos.add(tuple(sorted(bands)))
 
     return combos
