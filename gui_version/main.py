@@ -20,16 +20,57 @@ write_comparison_reports = analyzer.write_comparison_reports
 
 
 class ExtractorGUI:
+    @staticmethod
+    def _detect_scale(root: Any) -> float:
+        """Detect the display's scaling factor (100% = 1.0, 200% = 2.0, ...).
+
+        Queries the display server via Tk itself (works through XWayland on
+        Wayland/GNOME, and natively on X11/Windows/macOS), so it reflects
+        whatever scaling the *user* has configured rather than any value
+        hardcoded here.
+        """
+        try:
+            dpi = root.winfo_fpixels("1i")  # pixels per inch, per the display server
+            scale = dpi / 96.0  # 96 DPI is the Tk/X11 "100%" baseline
+            if not (0.5 <= scale <= 4.0):  # reject bogus/unreported values
+                raise ValueError(f"implausible DPI-derived scale: {scale}")
+            return scale
+        except Exception:
+            return 1.0  # safe fallback: behave like today, unscaled
+
+    def s(self, px: int) -> int:
+        """Scale a raw pixel value by the detected display scaling factor."""
+        return round(px * self.scale)
+
     def __init__(self) -> None:
         import tkinter as tk
+        import tkinter.font as tkfont
         from tkinter import ttk
 
         self.tk = tk
         self.ttk = ttk
         self.root = tk.Tk()
+
+        # Detect the user's display scaling and make Tk's own point->pixel
+        # conversion match it, so fonts and anything sized in points (the
+        # ttk default) come out the right physical size automatically.
+        self.scale = self._detect_scale(self.root)
+        self.root.tk.call("tk", "scaling", self.scale * 1.333333)
+
+        # Everything below is sized in raw pixels (geometry, padx/pady,
+        # Treeview column widths), which `tk scaling` does NOT touch, so we
+        # scale those numbers ourselves via self.s(). If you add more
+        # pixel-based sizes later, always wrap them in self.s(...) too.
+
         self.root.title(f"qcom-rfcard-mbn-parser GUI {VERSION}")
-        self.root.geometry("900x720")
-        self.root.minsize(900, 400)
+        self.root.geometry(f"{self.s(900)}x{self.s(720)}")
+        self.root.minsize(self.s(900), self.s(400))
+
+        # Bump the row height of the Treeview to match the scaled font,
+        # since ttk doesn't do this automatically.
+        style = ttk.Style()
+        row_font = tkfont.nametofont("TkDefaultFont")
+        style.configure("Treeview", rowheight=int(row_font.metrics("linespace") * 1.5))
 
         self.source: Path | None = None  # most recently imported source
         self.imported_sources: list[Path] = []
@@ -48,15 +89,15 @@ class ExtractorGUI:
             "b826": tk.BooleanVar(value=False),
         }
 
-        outer = ttk.Frame(self.root, padding=12)
+        outer = ttk.Frame(self.root, padding=self.s(12))
         outer.pack(fill="both", expand=True)
 
         top = ttk.Frame(outer)
-        top.pack(fill="x", pady=(0, 10))
+        top.pack(fill="x", pady=(0, self.s(10)))
         self.import_button = ttk.Button(top, text="Import .img or .mbn", command=self.choose_source)
         self.import_button.pack(side="left")
         ttk.Label(top, textvariable=self.source_var).pack(
-            side="left", fill="x", expand=True, padx=(12, 12)
+            side="left", fill="x", expand=True, padx=(self.s(12), self.s(12))
         )
         self.clear_imports_button = ttk.Button(
             top,
@@ -82,13 +123,13 @@ class ExtractorGUI:
             "extract": "Extract",
         }
         widths = {
-            "extract": 70,
-            "generation": 120,
-            "identity": 145,
-            "size": 95,
-            "lte": 90,
-            "nr": 140,
-            "path": 620,
+            "extract": self.s(70),
+            "generation": self.s(120),
+            "identity": self.s(145),
+            "size": self.s(95),
+            "lte": self.s(90),
+            "nr": self.s(140),
+            "path": self.s(620),
         }
         for column in columns:
             self.tree.heading(column, text=headings[column])
@@ -110,8 +151,8 @@ class ExtractorGUI:
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
 
-        export_row = ttk.LabelFrame(outer, text="Export formats", padding=10)
-        export_row.pack(fill="x", pady=(10, 8))
+        export_row = ttk.LabelFrame(outer, text="Export formats", padding=self.s(10))
+        export_row.pack(fill="x", pady=(self.s(10), self.s(8)))
         labels = {
             "mbn": "MBN dump",
             "json": "JSON",
@@ -124,11 +165,11 @@ class ExtractorGUI:
                 export_row,
                 text=labels[key],
                 variable=self.format_vars[key],
-            ).pack(side="left", padx=(0, 16))
+            ).pack(side="left", padx=(0, self.s(16)))
 
         # Selection buttons
         selection_frame = ttk.Frame(export_row)
-        selection_frame.pack(side="right", padx=(12, 0))
+        selection_frame.pack(side="right", padx=(self.s(12), 0))
 
         BUTTON_WIDTH = 12
 
@@ -144,25 +185,25 @@ class ExtractorGUI:
             text="Select all",
             width=BUTTON_WIDTH,
             command=self.select_all,
-        ).pack(side="left", padx=(8, 0))
+        ).pack(side="left", padx=(self.s(8), 0))
 
         self.compare_button = ttk.Button(
             selection_frame,
             text="Compare",
             command=self.choose_compare,
         )
-        self.compare_button.pack(side="right", padx=(20, 0))
+        self.compare_button.pack(side="right", padx=(self.s(20), 0))
 
         self.export_button = ttk.Button(
             selection_frame,
             text="Export",
             command=self.choose_export,
         )
-        self.export_button.pack(side="right", padx=(8, 0))
+        self.export_button.pack(side="right", padx=(self.s(8), 0))
 
         ttk.Label(outer, textvariable=self.status_var).pack(fill="x")
         self.log = tk.Text(outer, height=7, wrap="word", state="disabled")
-        self.log.pack(fill="x", pady=(5, 0))
+        self.log.pack(fill="x", pady=(self.s(5), 0))
 
     def append_log(self, message: str) -> None:
         self.log.configure(state="normal")
@@ -637,4 +678,3 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(cli_main())
-
