@@ -18,11 +18,14 @@ Keep this file beside ``legacy_rf_parser.py`` and
 from __future__ import annotations
 
 import csv
+import datetime
 import hashlib
+import itertools
 import json
 import logging
 import re
 import struct
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -711,7 +714,9 @@ def _legacy_b826_packets(
                         ul_qam_cap_index=0,
                     )
                 )
-            prop = SimpleNamespace(ul_tx_switch_type=int(combo.get("ul_tx_switch_type_raw", 0)))
+            prop = SimpleNamespace(
+                ul_tx_switch_type=int(combo.get("ul_tx_switch_type_raw") or 0)
+            )
             records.append((groups, prop))
         packets = modern.b826_v22_packets(records, source) if records else []
         output.extend(
@@ -827,12 +832,25 @@ def _find_legacy_lte_array(
         unique.setdefault((item[1], item[2]), item)
     if not unique:
         return None
+
+    if len(unique) > 1:
+        # A few generated ELFs contain a valid one-record helper/internal
+        # LTE array in addition to the public LTE CA table. It is not the
+        # advertised capability inventory. Ignore it only when at least one
+        # larger candidate exists.
+        nontrivial = {
+            key: item for key, item in unique.items() if item[2] > 1
+        }
+        if nontrivial:
+            unique = nontrivial
+
     if len(unique) > 1:
         details = ", ".join(
             f"0x{item[0]:X}->{item[2]} records at 0x{item[1]:X}"
             for item in unique.values()
         )
         raise ToolError(f"Ambiguous legacy LTE CA arrays: {details}")
+
     return next(iter(unique.values()))
 
 
@@ -947,6 +965,23 @@ def parse_legacy(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
     components: list[dict[str, Any]] = []
     inference_notes: list[str] = []
 
+    # Prefer the authoritative generated-symbol names exposed by
+    # legacy_rf_parser v3. Older analyzer revisions blindly scanned every
+    # plausible {count, pointer} pair and could confuse a one-record helper/
+    # internal LTE array with the real public LTE CA table.
+    symbols = legacy.read_dynamic_symbols(blob, image)
+    lte_result = legacy.parse_lteca_symbol_table(
+        Path(record.name),
+        blob,
+        image,
+        symbols,
+        record.inner_path,
+    )
+
+    # Retain the structural scanner only for stripped ELFs that have no usable
+    # dynamic symbols.
+    if lte_result is None:
+        lte_result = _parse_legacy_lte_array(record, blob, image)
     if lte_result is not None:
         parsed.append(("lte_ca", lte_result))
 
@@ -988,7 +1023,7 @@ def parse_legacy(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
                     "ul_tx_switch_type": combo.get("ul_tx_switch_type_raw", 0),
                     "higher_power_limit": combo.get("higher_power_limit"),
                     "descriptor_offset": result["descriptor"]["file_offset_hex"],
-                    "combo_flags": combo["combo_flags"],
+                    "combo_flags": combo.get("combo_flags", combo.get("lte_combo_flag_raw", 0)),
                     "envelope_mask": combo["envelope_mask"],
                     "subset_mask": combo["subset_mask"],
                     "raw_hex": combo["raw_hex"],
@@ -1047,7 +1082,7 @@ def parse_legacy(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
                     "ul_tx_switch_type": None,
                     "higher_power_limit": None,
                     "descriptor_offset": lte_result["descriptor"]["file_offset_hex"],
-                    "combo_flags": combo["combo_flags"],
+                    "combo_flags": combo.get("combo_flags", combo.get("lte_combo_flag_raw", 0)),
                     "envelope_mask": None,
                     "subset_mask": None,
                     "raw_hex": combo["raw_hex"],
@@ -1712,14 +1747,40 @@ def _append_difference_list(
         key=lambda item: _format_combo_signature(item).casefold(),
     )
 
-    for value in ordered_values:
-        text = _format_combo_signature(value)
+    if current_values is not None:
+        candidates_by_topo: dict[Any, list[tuple[Any, ...]]] = defaultdict(list)
+        for candidate in current_values:
+            topo = _signature_topology(candidate)
+            if topo is not None:
+                candidates_by_topo[topo].append(candidate)
 
-        if current_values is not None:
-            note = _variant_note(value, current_values)
-            text += f" ({note})"
-
-        lines.append(f"  {text}")
+        for value in ordered_values:
+            text = _format_combo_signature(value)
+            removed_topo = _signature_topology(value)
+            candidates = candidates_by_topo.get(removed_topo, [])
+            if not candidates:
+                note = "DELETED"
+            else:
+                removed_bw = _signature_bw(value)
+                removed_mimo = _signature_mimo(value)
+                notes: list[tuple[int, str]] = []
+                for cand in candidates:
+                    bw_ch = _signature_bw(cand) != removed_bw
+                    mimo_ch = _signature_mimo(cand) != removed_mimo
+                    if bw_ch and mimo_ch:
+                        notes.append((2, "BW and MIMO changed"))
+                    elif bw_ch:
+                        notes.append((1, "BW changed"))
+                    elif mimo_ch:
+                        notes.append((1, "MIMO changed"))
+                    else:
+                        notes.append((0, "Combo still exists"))
+                notes.sort(key=lambda item: (item[0], item[1]))
+                note = notes[0][1]
+            lines.append(f"  {text} ({note})")
+    else:
+        for value in ordered_values:
+            lines.append(f"  {_format_combo_signature(value)}")
 #######################
 def _identical_groups(
     analyses: Sequence[tuple[ModuleRecord, dict[str, Any]]],
@@ -1764,12 +1825,14 @@ def write_comparison_reports(
     records: Sequence[ModuleRecord],
     output_root: Path,
     progress: Callable[[str], None] | None = None,
-) -> tuple[Path, Path]:
-    """Compare checked GUI modules and write separate LTE and NR text reports."""
+) -> list[Path]:
+    """Compare checked GUI modules and write reports into a dedicated subfolder."""
     if len(records) < 2:
         raise ToolError("Select at least two MBNs to compare")
 
-    output_root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%y%m%d%H%M%S")
+    target_dir = output_root / f"compare-{timestamp}"
+    target_dir.mkdir(parents=True, exist_ok=True)
     analyses: list[tuple[ModuleRecord, dict[str, Any]]] = []
     failures: list[tuple[ModuleRecord, str]] = []
 
@@ -1858,9 +1921,6 @@ def write_comparison_reports(
             ref_lte_combos - combos,
             current_values=combos,
         )
-        _append_difference_list(
-            lte_lines, "LTE combos removed", ref_lte_combos - combos
-        )
 
     lte_lines.extend(["", "=" * 80, "IDENTICAL LTE TABLE GROUPS"])
     lte_groups = _identical_groups(analyses, lte_tables)
@@ -1923,11 +1983,6 @@ def write_comparison_reports(
                 reference - current,
                 current_values=current,
             )
-            _append_difference_list(
-                nr_lines,
-                f"{TABLE_DISPLAY[table]} combos removed",
-                reference - current,
-            )
 
     nr_lines.extend(["", "=" * 80, "IDENTICAL NR TABLE GROUPS"])
     nr_groups = _identical_groups(analyses, nr_tables)
@@ -1937,14 +1992,253 @@ def write_comparison_reports(
     else:
         nr_lines.append("(none)")
 
-    lte_path = output_root / "rfcard_lte_compare.txt"
-    nr_path = output_root / "rfcard_nr_compare.txt"
+    lte_path = target_dir / "rfcard_lte_compare.txt"
+    nr_path = target_dir / "rfcard_nr_compare.txt"
     lte_path.write_text("\n".join(lte_lines) + "\n", encoding="utf-8")
     nr_path.write_text("\n".join(nr_lines) + "\n", encoding="utf-8")
     if progress:
         progress(f"Wrote {lte_path}")
         progress(f"Wrote {nr_path}")
-    return lte_path, nr_path
+
+    csv_paths = write_simplified_comparison_csvs(
+        records,
+        analyses,
+        target_dir,
+        progress,
+    )
+    return [*csv_paths, lte_path, nr_path]
+
+
+_CC_CLASS_MAP = {
+    "A": 1,
+    "B": 2,
+    "C": 2,
+    "D": 3,
+    "E": 4,
+    "F": 5,
+    "G": 6,
+    "H": 7,
+    "I": 8,
+}
+
+
+def format_simplified_component(comp: dict[str, Any]) -> tuple[str, int, int, int, str]:
+    """Format a single component into simplified notation (omitting 'A' unless not class A).
+
+    Returns:
+        (comp_str, cc_count, is_nr, band, dl_class)
+    """
+    tech = comp.get("technology", "LTE")
+    is_nr = 1 if tech == "NR" else 0
+    prefix = "n" if is_nr else ""
+    band = int(comp.get("band", 0))
+    dl = comp.get("dl_bw_class", "-")
+    dl_str = "" if dl in ("-", "", None, "X0", 0, "0") else str(dl).upper()
+    class_str = "" if dl_str in ("A", "") else dl_str
+    if dl_str or class_str:
+        comp_str = f"{prefix}{band}{class_str}"
+    else:
+        comp_str = f"{prefix}{band}_"
+    cc = _CC_CLASS_MAP.get(dl_str, 1)
+    return comp_str, cc, is_nr, band, dl_str
+
+
+def combo_simplified_key(
+    table: str,
+    components: Sequence[dict[str, Any]],
+) -> tuple[int, tuple[tuple[int, int, str], ...], str]:
+    """Calculate the sort key for a simplified combination.
+
+    Sort order:
+    1. Smallest CC count first (1CC, 2CC, 3CC, 4CC, 5CC...)
+    2. Band numbers from low to high (by first band, then second band...)
+    3. DL bandwidth classes
+    4. Exact combo string tiebreaker
+    """
+    formatted = [format_simplified_component(c) for c in components]
+    if table == "endc":
+        lte_parts = [f[0] for f in formatted if f[2] == 0]
+        nr_parts = [f[0] for f in formatted if f[2] == 1]
+        combo_str = f"{'-'.join(lte_parts)}_{'-'.join(nr_parts)}"
+    elif table == "nrdc":
+        fr1_parts = [f[0] for f in formatted if f[3] < 100]
+        fr2_parts = [f[0] for f in formatted if f[3] >= 100]
+        if fr1_parts and fr2_parts:
+            combo_str = f"{'-'.join(fr1_parts)}_{'-'.join(fr2_parts)}"
+        else:
+            combo_str = "-".join(f[0] for f in formatted)
+    else:
+        combo_str = "-".join(f[0] for f in formatted)
+
+    total_cc = sum(f[1] for f in formatted)
+    band_tuple = tuple((f[2], f[3], f[4]) for f in formatted)
+    return total_cc, band_tuple, combo_str
+
+
+NR_SDL_BANDS = {29, 67, 75, 76}
+LTE_SDL_BANDS = {29, 32, 67, 75, 76}
+
+
+def get_simplified_combos_dict(
+    parsed: dict[str, Any],
+) -> dict[str, dict[str, tuple[int, tuple[tuple[int, int, str], ...], str]]]:
+    """Extract unique simplified combos per category including automatically filled subsets."""
+    grouped: dict[str, dict[tuple[Any, int], list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+    for comp in parsed.get("components", []):
+        table = comp["table"]
+        key = (comp.get("sub_capability"), comp["combo_index"])
+        grouped[table][key].append(comp)
+
+    result: dict[str, dict[str, tuple[int, tuple[tuple[int, int, str], ...], str]]] = {}
+    for table, combo_dict in grouped.items():
+        unique: dict[str, tuple[int, tuple[tuple[int, int, str], ...], str]] = {}
+        for _sub_cap_and_index, comps in combo_dict.items():
+            comps.sort(key=lambda c: c.get("position", 0))
+            if table == "endc":
+                lte_comps = [c for c in comps if c.get("technology") == "LTE"]
+                nr_comps = [c for c in comps if c.get("technology") == "NR"]
+                for l_r in range(1, len(lte_comps) + 1):
+                    for l_sub in itertools.combinations(lte_comps, l_r):
+                        if all(int(c.get("band", 0)) in LTE_SDL_BANDS for c in l_sub):
+                            continue
+                        for n_r in range(1, len(nr_comps) + 1):
+                            for n_sub in itertools.combinations(nr_comps, n_r):
+                                if all(int(c.get("band", 0)) in NR_SDL_BANDS for c in n_sub):
+                                    continue
+                                sub = list(l_sub) + list(n_sub)
+                                k = combo_simplified_key(table, sub)
+                                unique[k[2]] = k
+            elif table == "nr_ca":
+                for r in range(1, len(comps) + 1):
+                    for sub in itertools.combinations(comps, r):
+                        if all(int(c.get("band", 0)) in NR_SDL_BANDS for c in sub):
+                            continue
+                        k = combo_simplified_key(table, list(sub))
+                        unique[k[2]] = k
+            elif table == "lte_ca":
+                for r in range(1, len(comps) + 1):
+                    for sub in itertools.combinations(comps, r):
+                        if all(int(c.get("band", 0)) in LTE_SDL_BANDS for c in sub):
+                            continue
+                        k = combo_simplified_key(table, list(sub))
+                        unique[k[2]] = k
+            elif table == "nrdc":
+                fr1_comps = [c for c in comps if int(c.get("band", 0)) < 100]
+                fr2_comps = [c for c in comps if int(c.get("band", 0)) >= 100]
+                if fr1_comps and fr2_comps:
+                    for f1_r in range(1, len(fr1_comps) + 1):
+                        for f1_sub in itertools.combinations(fr1_comps, f1_r):
+                            if all(int(c.get("band", 0)) in NR_SDL_BANDS for c in f1_sub):
+                                continue
+                            for f2_r in range(1, len(fr2_comps) + 1):
+                                for f2_sub in itertools.combinations(fr2_comps, f2_r):
+                                    sub = list(f1_sub) + list(f2_sub)
+                                    k = combo_simplified_key(table, sub)
+                                    unique[k[2]] = k
+                else:
+                    for r in range(1, len(comps) + 1):
+                        for sub in itertools.combinations(comps, r):
+                            k = combo_simplified_key(table, list(sub))
+                            unique[k[2]] = k
+            else:
+                k = combo_simplified_key(table, comps)
+                unique[k[2]] = k
+        result[table] = unique
+    return result
+
+
+def _make_column_headers(records: Sequence[ModuleRecord]) -> list[str]:
+    names = [r.name for r in records]
+    if len(set(names)) == len(names):
+        return names
+    headers = []
+    seen: dict[str, int] = {}
+    for r in records:
+        count = seen.get(r.name, 0) + 1
+        seen[r.name] = count
+        if names.count(r.name) > 1:
+            headers.append(f"{r.name} ({r.identity})")
+        else:
+            headers.append(r.name)
+    return headers
+
+
+def write_simplified_comparison_csvs(
+    records: Sequence[ModuleRecord],
+    analyses: Sequence[tuple[ModuleRecord, dict[str, Any]]],
+    output_root: Path,
+    progress: Callable[[str], None] | None = None,
+) -> list[Path]:
+    """Write column-sorted comparison CSVs with aligned rows and empty cells for missing combos."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    headers = _make_column_headers(records)
+    parsed_cards = [get_simplified_combos_dict(parsed) for _, parsed in analyses]
+
+    table_specs = [
+        ("lte_ca", "LTE CA", "rfcard_compare_lte.csv"),
+        ("endc", "EN-DC", "rfcard_compare_endc.csv"),
+        ("nr_ca", "NR-CA", "rfcard_compare_nrca.csv"),
+        ("nrdc", "NR-DC", "rfcard_compare_nrdc.csv"),
+    ]
+
+    written_paths: list[Path] = []
+
+    for table_key, table_label, filename in table_specs:
+        all_combos: dict[str, tuple[int, tuple[tuple[int, int, str, str], ...], str]] = {}
+        for card_data in parsed_cards:
+            table_combos = card_data.get(table_key, {})
+            for combo_str, sort_key in table_combos.items():
+                if combo_str not in all_combos:
+                    all_combos[combo_str] = sort_key
+
+        if not all_combos:
+            continue
+
+        sorted_combos = [k[2] for k in sorted(all_combos.values())]
+        target_path = output_root / filename
+        with target_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(headers)
+            for combo_str in sorted_combos:
+                row = [
+                    combo_str if combo_str in card_data.get(table_key, {}) else ""
+                    for card_data in parsed_cards
+                ]
+                writer.writerow(row)
+        written_paths.append(target_path)
+        if progress:
+            progress(f"Wrote {target_path} ({len(sorted_combos)} rows)")
+
+    # Master combined CSV with all categories
+    all_path = output_root / "rfcard_compare_all.csv"
+    with all_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        for table_key, table_label, _ in table_specs:
+            all_combos = {}
+            for card_data in parsed_cards:
+                table_combos = card_data.get(table_key, {})
+                for combo_str, sort_key in table_combos.items():
+                    if combo_str not in all_combos:
+                        all_combos[combo_str] = sort_key
+
+            if not all_combos:
+                continue
+
+            sorted_combos = [k[2] for k in sorted(all_combos.values())]
+            writer.writerow([f"=== {table_label} ==="] * len(headers))
+            for combo_str in sorted_combos:
+                row = [
+                    combo_str if combo_str in card_data.get(table_key, {}) else ""
+                    for card_data in parsed_cards
+                ]
+                writer.writerow(row)
+            writer.writerow([""] * len(headers))
+    written_paths.append(all_path)
+    if progress:
+        progress(f"Wrote {all_path}")
+
+    return written_paths
 
 
 __all__ = [
@@ -1961,4 +2255,8 @@ __all__ = [
     "export_module",
     "export_many",
     "write_comparison_reports",
+    "write_simplified_comparison_csvs",
+    "format_simplified_component",
+    "combo_simplified_key",
+    "get_simplified_combos_dict",
 ]

@@ -17,7 +17,11 @@ folder.
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
+import functools
 import hashlib
+import itertools
 import re
 import sys
 from collections import defaultdict
@@ -148,6 +152,7 @@ def _split_side(side: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(bandwidth), tuple(mimo)
 
 
+@functools.lru_cache(maxsize=None)
 def combo_details(signature: ComboSignature) -> ComboDetails | None:
     """Return topology, BW and MIMO dimensions for variant-aware comparison."""
     topology: list[tuple[str, int, str, str]] = []
@@ -647,9 +652,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     output_dir = (args.output_dir or root).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    lte_path = output_dir / args.lte_output
-    nr_path = output_dir / args.nr_output
+    timestamp = datetime.datetime.now().strftime("%y%m%d%H%M%S")
+    comp_dir = output_dir / f"compare-{timestamp}"
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    lte_path = comp_dir / args.lte_output
+    nr_path = comp_dir / args.nr_output
 
     lte_path.write_text(
         make_lte_report(profiles, reference, failures, root, args.max_list),
@@ -662,12 +669,226 @@ def main(argv: Sequence[str] | None = None) -> int:
         newline="\n",
     )
 
+    csv_paths = write_simplified_comparison_csvs(profiles, comp_dir)
+
     print()
     print(f"Reference: {identity_text(reference)}")
     print(f"Parsed: {len(profiles)}; failed: {len(failures)}")
+    print(f"Created folder: {comp_dir.name}")
     print(f"Wrote {lte_path}")
     print(f"Wrote {nr_path}")
+    for cp in csv_paths:
+        print(f"Wrote {cp}")
     return 0 if not failures else 2
+
+
+_CC_CLASS_MAP = {
+    "A": 1,
+    "B": 2,
+    "C": 2,
+    "D": 3,
+    "E": 4,
+    "F": 5,
+    "G": 6,
+    "H": 7,
+    "I": 8,
+}
+
+
+def format_signature_component(
+    rat: str,
+    band: int,
+    dl_class: str,
+) -> tuple[str, int, int, int, str]:
+    is_nr = 1 if rat.upper() == "N" else 0
+    prefix = "n" if is_nr else ""
+    dl_str = "" if dl_class in ("-", "", "_", None, "X0", "0") else dl_class.upper()
+    class_str = "" if dl_str in ("A", "") else dl_str
+    if dl_str or class_str:
+        comp_str = f"{prefix}{band}{class_str}"
+    else:
+        comp_str = f"{prefix}{band}_"
+    cc = _CC_CLASS_MAP.get(dl_str, 1)
+    return comp_str, cc, is_nr, band, dl_str
+
+
+def combo_signature_key(
+    table_key: str,
+    components: Sequence[tuple[str, int, str]],
+) -> tuple[int, tuple[tuple[int, int, str], ...], str]:
+    formatted = [format_signature_component(*c) for c in components]
+    if table_key == "endc":
+        lte_parts = [f[0] for f in formatted if f[2] == 0]
+        nr_parts = [f[0] for f in formatted if f[2] == 1]
+        combo_str = f"{'-'.join(lte_parts)}_{'-'.join(nr_parts)}"
+    elif table_key == "nrdc":
+        fr1_parts = [f[0] for f in formatted if f[3] < 100]
+        fr2_parts = [f[0] for f in formatted if f[3] >= 100]
+        if fr1_parts and fr2_parts:
+            combo_str = f"{'-'.join(fr1_parts)}_{'-'.join(fr2_parts)}"
+        else:
+            combo_str = "-".join(f[0] for f in formatted)
+    else:
+        combo_str = "-".join(f[0] for f in formatted)
+
+    total_cc = sum(f[1] for f in formatted)
+    band_tuple = tuple((f[2], f[3], f[4]) for f in formatted)
+    return total_cc, band_tuple, combo_str
+
+
+NR_SDL_BANDS = {29, 67, 75, 76}
+LTE_SDL_BANDS = {29, 32, 67, 75, 76}
+
+
+def get_profile_simplified_combos(
+    profile: Profile,
+) -> dict[str, dict[str, tuple[int, tuple[tuple[int, int, str], ...], str]]]:
+    mapping = {
+        "ca_4g_combos": "lte_ca",
+        "ca_4g_5g_combos": "endc",
+        "ca_5g_combos": "nr_ca",
+        "ca_5g_5g_combos": "nrdc",
+    }
+    result: dict[str, dict[str, tuple[int, tuple[tuple[int, int, str], ...], str]]] = {}
+    for section_key, table_key in mapping.items():
+        unique: dict[str, tuple[int, tuple[tuple[int, int, str], ...], str]] = {}
+        for sig in profile.signatures.get(section_key, set()):
+            details = combo_details(sig)
+            if not details:
+                continue
+            comps = [(rat, band, dl_class) for rat, band, dl_class, _ul in details.topology]
+            if table_key == "endc":
+                lte_comps = [c for c in comps if c[0].upper() != "N"]
+                nr_comps = [c for c in comps if c[0].upper() == "N"]
+                for l_r in range(1, len(lte_comps) + 1):
+                    for l_sub in itertools.combinations(lte_comps, l_r):
+                        if all(c[1] in LTE_SDL_BANDS for c in l_sub):
+                            continue
+                        for n_r in range(1, len(nr_comps) + 1):
+                            for n_sub in itertools.combinations(nr_comps, n_r):
+                                if all(c[1] in NR_SDL_BANDS for c in n_sub):
+                                    continue
+                                sub = list(l_sub) + list(n_sub)
+                                k = combo_signature_key(table_key, sub)
+                                unique[k[2]] = k
+            elif table_key == "nr_ca":
+                for r in range(1, len(comps) + 1):
+                    for sub in itertools.combinations(comps, r):
+                        if all(c[1] in NR_SDL_BANDS for c in sub):
+                            continue
+                        k = combo_signature_key(table_key, list(sub))
+                        unique[k[2]] = k
+            elif table_key == "lte_ca":
+                for r in range(1, len(comps) + 1):
+                    for sub in itertools.combinations(comps, r):
+                        if all(c[1] in LTE_SDL_BANDS for c in sub):
+                            continue
+                        k = combo_signature_key(table_key, list(sub))
+                        unique[k[2]] = k
+            elif table_key == "nrdc":
+                fr1_comps = [c for c in comps if c[1] < 100]
+                fr2_comps = [c for c in comps if c[1] >= 100]
+                if fr1_comps and fr2_comps:
+                    for f1_r in range(1, len(fr1_comps) + 1):
+                        for f1_sub in itertools.combinations(fr1_comps, f1_r):
+                            if all(c[1] in NR_SDL_BANDS for c in f1_sub):
+                                continue
+                            for f2_r in range(1, len(fr2_comps) + 1):
+                                for f2_sub in itertools.combinations(fr2_comps, f2_r):
+                                    sub = list(f1_sub) + list(f2_sub)
+                                    k = combo_signature_key(table_key, sub)
+                                    unique[k[2]] = k
+                else:
+                    for r in range(1, len(comps) + 1):
+                        for sub in itertools.combinations(comps, r):
+                            k = combo_signature_key(table_key, list(sub))
+                            unique[k[2]] = k
+            else:
+                k = combo_signature_key(table_key, comps)
+                unique[k[2]] = k
+        result[table_key] = unique
+    return result
+
+
+def write_simplified_comparison_csvs(
+    profiles: Sequence[Profile],
+    output_root: Path,
+) -> list[Path]:
+    output_root.mkdir(parents=True, exist_ok=True)
+    names = [p.name for p in profiles]
+    headers = []
+    seen: dict[str, int] = {}
+    for p in profiles:
+        count = seen.get(p.name, 0) + 1
+        seen[p.name] = count
+        if names.count(p.name) > 1:
+            headers.append(f"{p.name} ({p.relative_path})")
+        else:
+            headers.append(p.name)
+
+    parsed_cards = [get_profile_simplified_combos(p) for p in profiles]
+
+    table_specs = [
+        ("lte_ca", "LTE CA", "rfcard_compare_lte.csv"),
+        ("endc", "EN-DC", "rfcard_compare_endc.csv"),
+        ("nr_ca", "NR-CA", "rfcard_compare_nrca.csv"),
+        ("nrdc", "NR-DC", "rfcard_compare_nrdc.csv"),
+    ]
+
+    written_paths: list[Path] = []
+
+    for table_key, table_label, filename in table_specs:
+        all_combos: dict[str, tuple[int, tuple[tuple[int, int, str, str], ...], str]] = {}
+        for card_data in parsed_cards:
+            table_combos = card_data.get(table_key, {})
+            for combo_str, sort_key in table_combos.items():
+                if combo_str not in all_combos:
+                    all_combos[combo_str] = sort_key
+
+        if not all_combos:
+            continue
+
+        sorted_combos = [k[2] for k in sorted(all_combos.values())]
+        target_path = output_root / filename
+        with target_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(headers)
+            for combo_str in sorted_combos:
+                row = [
+                    combo_str if combo_str in card_data.get(table_key, {}) else ""
+                    for card_data in parsed_cards
+                ]
+                writer.writerow(row)
+        written_paths.append(target_path)
+
+    # Master combined CSV
+    all_path = output_root / "rfcard_compare_all.csv"
+    with all_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        for table_key, table_label, _ in table_specs:
+            all_combos = {}
+            for card_data in parsed_cards:
+                table_combos = card_data.get(table_key, {})
+                for combo_str, sort_key in table_combos.items():
+                    if combo_str not in all_combos:
+                        all_combos[combo_str] = sort_key
+
+            if not all_combos:
+                continue
+
+            sorted_combos = [k[2] for k in sorted(all_combos.values())]
+            writer.writerow([f"=== {table_label} ==="] * len(headers))
+            for combo_str in sorted_combos:
+                row = [
+                    combo_str if combo_str in card_data.get(table_key, {}) else ""
+                    for card_data in parsed_cards
+                ]
+                writer.writerow(row)
+            writer.writerow([""] * len(headers))
+    written_paths.append(all_path)
+
+    return written_paths
 
 
 if __name__ == "__main__":

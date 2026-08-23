@@ -539,18 +539,20 @@ class ExtractorGUI:
     def compare_finished(
         self,
         output: Path,
-        reports: tuple[Path, Path],
+        reports: Sequence[Path],
         count: int,
     ) -> None:
         from tkinter import messagebox
 
-        self.set_busy(False, f"Compared {count} MBN(s); reports written to {output}")
+        report_dir = reports[0].parent if reports else output
+        self.set_busy(False, f"Compared {count} MBN(s); reports written to {report_dir}")
+        report_list = "\n".join(f"• {r.name}" for r in reports)
         messagebox.showinfo(
             "Comparison complete",
-            f"Compared {count} MBN(s).\\n\\n"
-            f"LTE report: {reports[0].name}\\n"
-            f"NR report: {reports[1].name}\\n\\n"
-            f"{output}",
+            f"Compared {count} MBN(s).\n\n"
+            f"Created folder: {report_dir.name}\n\n"
+            f"Generated reports:\n{report_list}\n\n"
+            f"{report_dir}",
         )
 
     def choose_export(self) -> None:
