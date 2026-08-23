@@ -2201,7 +2201,9 @@ def write_simplified_comparison_csvs(
             writer.writerow(headers)
             for combo_str in sorted_combos:
                 row = [
-                    combo_str if combo_str in card_data.get(table_key, {}) else ""
+                    (f'="{combo_str}"' if table_key == "lte_ca" else combo_str)
+                    if combo_str in card_data.get(table_key, {})
+                    else ""
                     for card_data in parsed_cards
                 ]
                 writer.writerow(row)
@@ -2229,7 +2231,9 @@ def write_simplified_comparison_csvs(
             writer.writerow([f"=== {table_label} ==="] * len(headers))
             for combo_str in sorted_combos:
                 row = [
-                    combo_str if combo_str in card_data.get(table_key, {}) else ""
+                    (f'="{combo_str}"' if table_key == "lte_ca" else combo_str)
+                    if combo_str in card_data.get(table_key, {})
+                    else ""
                     for card_data in parsed_cards
                 ]
                 writer.writerow(row)
