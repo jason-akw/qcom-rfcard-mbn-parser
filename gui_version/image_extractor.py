@@ -9,6 +9,12 @@ containers (sparse, payload, super, ext4, EROFS, squashfs, F2FS, UBI, FAT,
 gzip/xz/zstd/zip/tar/7z, etc.) and returns the paths of any matching MBNs plus
 co-located sidecar files.
 
+Apple ships the same Qualcomm cards inside a ``.bbfw``/``.ipsw``, where they are
+compressed and content-addressed rather than stored under an ``rf_config_*``
+name.  ``extract_bbcfg`` delegates to ``iphone_rf_parser`` to recover them and
+writes them out under the Android naming convention, so everything downstream -
+discovery, the analyzer, and the GUI - stays unchanged.
+
 All external helpers are optional; missing tools are logged once and skipped.
 """
 
@@ -234,7 +240,11 @@ def detect(path: Path) -> str:
         return "zstd"
     if head.startswith(b"\x04\x22\x4d\x18"):
         return "lz4"
-    if head.startswith(b"PK\x03\x04"):
+    # Apple baseband config container (the bbcfg.mbn member of a .bbfw).
+    # Checked before the archive tags below because it is a bare container.
+    if head.startswith(b"\x00GFC") or b"BBCFGMBN" in head[:64]:
+        return "bbcfg"
+    if head.startswith(b"PK\x03\x04") or path.suffix.lower() in (".bbfw", ".ipsw"):
         return "zip"
     if head[:4] == b"7z\xbc\xaf" and head[4:6] == b"\x27\x1c":
         return "7z"
@@ -484,10 +494,147 @@ def _stderr(res: subprocess.CompletedProcess) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Apple baseband firmware
+# ---------------------------------------------------------------------------
+
+
+def _ber_length(blob: bytes, pos: int) -> tuple[int | None, int]:
+    """Decode a BER/DER length at ``pos``; return ``(length, body_offset)``."""
+    try:
+        first = blob[pos]
+    except IndexError:
+        return None, pos
+    if first < 0x80:
+        return first, pos + 1
+    count = first & 0x7F
+    if not 1 <= count <= 4:
+        return None, pos
+    start = pos + 1
+    chunk = blob[start:start + count]
+    if len(chunk) != count:
+        return None, pos
+    return int.from_bytes(chunk, "big"), start + count
+
+
+def extract_bbcfg(path: Path, ctx: ExtractContext) -> Path | None:
+    """Extract an Apple Qualcomm baseband config container (``BBCFGMBN``).
+
+    Apple stores the RF cards compressed and content-addressed in the tag-0xA9
+    blob store, so scanning for EFS pathname tags alone finds ``device_lut``
+    and ``device_settings`` but never a card.  ``iphone_rf_parser`` walks that
+    store and writes the cards under Android-style ``rf_config_*.mbn`` names,
+    which is what lets the rest of this module treat them like any other MBN.
+    The EFS pathname scan below still runs afterwards so the EFS tree is
+    preserved alongside the cards.
+    """
+    out = _new_workdir(ctx, "bbcfg")
+    cards: list = []
+    try:
+        import iphone_rf_parser
+
+        cards = iphone_rf_parser.extract_bbcfg_tree(path, out, with_efs=False)
+        if cards:
+            logger.info(
+                "iphone_rf_parser recovered %d RF card(s) from %s",
+                len(cards),
+                path.name,
+            )
+    except Exception as exc:  # noqa: BLE001 - never let this abort a scan
+        logger.warning("iPhone RF card recovery failed for %s: %s", path, exc)
+
+    # Walk the EFS pathname/value records so the surrounding config tree is
+    # available next to the recovered cards.
+    written = 0
+    try:
+        data = path.read_bytes()
+        tag_path = b"\x9f\x83\x74"
+        tag_data = b"\x9f\x83\x76"
+        pos = 0
+        while True:
+            idx = data.find(tag_path, pos)
+            if idx == -1:
+                break
+            path_len, path_start = _ber_length(data, idx + 3)
+            if path_len is None:
+                pos = idx + 3
+                continue
+            try:
+                name = data[path_start:path_start + path_len].decode("utf-8").strip("\x00")
+            except UnicodeDecodeError:
+                pos = idx + 3
+                continue
+            value_idx = data.find(
+                tag_data, path_start + path_len, path_start + path_len + 64
+            )
+            if value_idx == -1:
+                pos = path_start + path_len
+                continue
+            data_len, data_start = _ber_length(data, value_idx + 3)
+            if data_len is None:
+                pos = idx + 3
+                continue
+            target = (out / name.lstrip("/")).resolve()
+            if out.resolve() not in target.parents:
+                # An EFS pathname is attacker-controlled data; never let one
+                # escape the scratch directory via "..".
+                logger.warning("skipping out-of-tree EFS pathname %r", name)
+                pos = data_start + data_len
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data[data_start:data_start + data_len])
+            written += 1
+            pos = data_start + data_len
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bbcfg EFS scan failed for %s: %s", path, exc)
+
+    # Report success when either half produced something; the RF cards are the
+    # point of this extractor, so they must not be discarded when a firmware
+    # image happens to carry no EFS pathname records.
+    if cards or written:
+        return out
+    return None
+
+
+def extract_zip(path: Path, ctx: ExtractContext) -> Path | None:
+    """Extract a standard ZIP archive, or a ``.bbfw``/``.ipsw`` (both are ZIPs).
+
+    An IPSW is tens of gigabytes and holds exactly one thing of interest, so
+    when the archive contains ``.bbfw`` members only those are unpacked; the
+    recursive unwrap then opens each one normally.  Archives without ``.bbfw``
+    members - every Android package - are extracted in full as before.
+    """
+    import zipfile
+
+    out = _new_workdir(ctx, "zip")
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            basebands = [
+                name for name in archive.namelist() if name.lower().endswith(".bbfw")
+            ]
+            if basebands:
+                logger.info(
+                    "%s: extracting %d baseband member(s) only",
+                    path.name,
+                    len(basebands),
+                )
+                for member in basebands:
+                    archive.extract(member, out)
+            else:
+                archive.extractall(out)
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "zipfile extraction failed for %s (%s); falling back to 7z", path, exc
+        )
+    return extract_7z(path, ctx, "zip")
+
+
+# ---------------------------------------------------------------------------
 # Recursion driver
 # ---------------------------------------------------------------------------
 
 EXTRACTORS: dict[str, Callable[[Path, ExtractContext], Path | None]] = {
+    "bbcfg": extract_bbcfg,
     "sparse": extract_sparse,
     "ext4": extract_ext4,
     "erofs": extract_erofs,
@@ -498,7 +645,7 @@ EXTRACTORS: dict[str, Callable[[Path, ExtractContext], Path | None]] = {
     "xz": extract_xz,
     "zstd": extract_zstd,
     "lz4": extract_lz4,
-    "zip": lambda p, c: extract_7z(p, c, "zip"),
+    "zip": extract_zip,
     "7z": lambda p, c: extract_7z(p, c, "7z"),
     "tar": extract_tar,
     "super": extract_super,
@@ -661,6 +808,7 @@ __all__ = [
     "detect",
     "discover_candidates",
     "extract_7z",
+    "extract_bbcfg",
     "extract_erofs",
     "extract_ext4",
     "extract_gzip",
@@ -670,6 +818,7 @@ __all__ = [
     "extract_super",
     "extract_tar",
     "extract_xz",
+    "extract_zip",
     "extract_zstd",
     "is_rfcard_name",
     "is_sidecar_name",

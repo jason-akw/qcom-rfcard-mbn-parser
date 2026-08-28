@@ -80,7 +80,9 @@ class ExtractorGUI:
         self.busy = False
 
         self.source_var = tk.StringVar(value="No imports")
-        self.status_var = tk.StringVar(value="Import a modem.img or RF MBN to begin.")
+        self.status_var = tk.StringVar(
+            value="Import a modem.img, RF MBN, or iPhone .ipsw/.bbfw to begin."
+        )
         self.format_vars = {
             "mbn": tk.BooleanVar(value=True),
             "json": tk.BooleanVar(value=False),
@@ -94,7 +96,7 @@ class ExtractorGUI:
 
         top = ttk.Frame(outer)
         top.pack(fill="x", pady=(0, self.s(10)))
-        self.import_button = ttk.Button(top, text="Import .img or .mbn", command=self.choose_source)
+        self.import_button = ttk.Button(top, text="Import .img, .mbn, or .ipsw", command=self.choose_source)
         self.import_button.pack(side="left")
         ttk.Label(top, textvariable=self.source_var).pack(
             side="left", fill="x", expand=True, padx=(self.s(12), self.s(12))
@@ -254,9 +256,11 @@ class ExtractorGUI:
             filetypes=(
                 (
                     "Modem images, archives, and MBNs",
-                    "*.img *.bin *.mbn *.gz *.xz *.zst *.zip *.tar *.tar.md5 *.tgz *.lz4 *.7z",
+                    "*.img *.bin *.mbn *.gz *.xz *.zst *.zip *.tar *.tar.md5 *.tgz *.lz4 *.7z"
+                    " *.bbfw *.ipsw",
                 ),
                 ("MBN files", "*.mbn"),
+                ("iPhone baseband firmware", "*.bbfw *.ipsw"),
                 ("Modem images and archives", "*.img *.bin *.gz *.xz *.zst *.zip *.tar *.tar.md5 *.tgz *.lz4 *.7z"),
                 ("All files", "*.*"),
             ),
@@ -414,7 +418,9 @@ class ExtractorGUI:
         self.checked_keys.clear()
         self.refresh_tree()
         self._update_source_label()
-        self.status_var.set("Imports cleared. Import a modem.img or RF MBN to begin.")
+        self.status_var.set(
+            "Imports cleared. Import a modem.img, RF MBN, or iPhone .ipsw/.bbfw to begin."
+        )
         self.clear_imports_button.configure(state="disabled")
         self.append_log("Cleared all imported sources and MBN rows.")
 
