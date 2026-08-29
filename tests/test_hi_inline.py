@@ -139,5 +139,73 @@ class LegacyFilenameTests(unittest.TestCase):
         self.assertEqual(self.analyzer._identity_value(match, "bid"), 0)
 
 
+class ModuleRecordComboTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        sys.path.insert(0, str(ROOT / "gui_version"))
+        import qualcomm_rf_combo_analyzer
+
+        cls.analyzer = qualcomm_rf_combo_analyzer
+
+    def test_zero_combos_is_discarded(self) -> None:
+        record = self.analyzer.ModuleRecord(
+            inner_path="test.mbn",
+            name="rf_config_2901_0_0.mbn",
+            generation="DAT/protobuf",
+            size=1000,
+            hwid=2901,
+            fsid=0,
+            bid=0,
+            lte_combos=0,
+            nr_combos="0+0+0=0",
+        )
+        self.assertEqual(record.total_combos, 0)
+        self.assertFalse(record.has_combos)
+
+    def test_blank_combos_is_discarded(self) -> None:
+        record = self.analyzer.ModuleRecord(
+            inner_path="test.mbn",
+            name="rf_config_2901_0_0.mbn",
+            generation="DAT/protobuf",
+            size=1000,
+            hwid=2901,
+            fsid=0,
+            bid=0,
+            lte_combos=-1,
+            nr_combos="—",
+        )
+        self.assertEqual(record.total_combos, 0)
+        self.assertFalse(record.has_combos)
+
+    def test_positive_combos_is_kept(self) -> None:
+        record_lte = self.analyzer.ModuleRecord(
+            inner_path="test.mbn",
+            name="rf_config_2025_0_0.mbn",
+            generation="DAT/protobuf",
+            size=1000,
+            hwid=2025,
+            fsid=0,
+            bid=0,
+            lte_combos=500,
+            nr_combos="0+0+0=0",
+        )
+        self.assertEqual(record_lte.total_combos, 500)
+        self.assertTrue(record_lte.has_combos)
+
+        record_nr = self.analyzer.ModuleRecord(
+            inner_path="test.mbn",
+            name="rf_config_2025_0_0.mbn",
+            generation="DAT/protobuf",
+            size=1000,
+            hwid=2025,
+            fsid=0,
+            bid=0,
+            lte_combos=0,
+            nr_combos="3131+420+34=3585",
+        )
+        self.assertEqual(record_nr.total_combos, 3585)
+        self.assertTrue(record_nr.has_combos)
+
+
 if __name__ == "__main__":
     unittest.main()

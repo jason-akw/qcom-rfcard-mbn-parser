@@ -84,6 +84,27 @@ class ModuleRecord:
             stem = stem[len("rf_config_"):]
         return stem
 
+    @property
+    def total_combos(self) -> int:
+        lte = max(0, self.lte_combos)
+        nr = 0
+        if self.nr_combos and self.nr_combos != "—":
+            if "=" in self.nr_combos:
+                try:
+                    nr = int(self.nr_combos.split("=")[-1].strip())
+                except ValueError:
+                    nr = 0
+            else:
+                try:
+                    nr = sum(int(p.strip()) for p in self.nr_combos.split("+") if p.strip().isdigit())
+                except ValueError:
+                    nr = 0
+        return lte + nr
+
+    @property
+    def has_combos(self) -> bool:
+        return self.total_combos > 0
+
 
 class ToolError(RuntimeError):
     pass

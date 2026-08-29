@@ -84,11 +84,11 @@ class ExtractorGUI:
             value="Import a modem.img, RF MBN, or iPhone .ipsw/.bbfw to begin."
         )
         self.format_vars = {
-            "mbn": tk.BooleanVar(value=True),
+            "mbn": tk.BooleanVar(value=False),
             "json": tk.BooleanVar(value=False),
             "csv": tk.BooleanVar(value=False),
-            "b0cd": tk.BooleanVar(value=False),
-            "b826": tk.BooleanVar(value=False),
+            "b0cd": tk.BooleanVar(value=True),
+            "b826": tk.BooleanVar(value=True),
         }
 
         outer = ttk.Frame(self.root, padding=self.s(12))
@@ -318,12 +318,19 @@ class ExtractorGUI:
         total_found = 0
         total_added = 0
         total_duplicates = 0
+        total_discarded_zero = 0
 
         for source, records in results:
             total_found += len(records)
             added_from_source = 0
+            discarded_zero_from_source = 0
 
             for record in records:
+                if not record.has_combos:
+                    discarded_zero_from_source += 1
+                    total_discarded_zero += 1
+                    continue
+
                 key = self._record_key(record)
 
                 if key in existing_keys:
@@ -339,10 +346,16 @@ class ExtractorGUI:
             if source not in self.imported_sources:
                 self.imported_sources.append(source)
 
-            self.append_log(
-                f"Added {added_from_source} candidate RF MBN(s) "
-                f"from {source.name}."
-            )
+            if discarded_zero_from_source:
+                self.append_log(
+                    f"Added {added_from_source} candidate RF MBN(s) "
+                    f"from {source.name} (discarded {discarded_zero_from_source} zero/blank combo MBN(s))."
+                )
+            else:
+                self.append_log(
+                    f"Added {added_from_source} candidate RF MBN(s) "
+                    f"from {source.name}."
+                )
 
         for source, error in failures:
             final_line = error.strip().splitlines()[-1]
@@ -380,7 +393,11 @@ class ExtractorGUI:
     def scan_finished(self, source: Path, records: list[ModuleRecord]) -> None:
         existing_keys = {self._record_key(record) for record in self.records}
         added: list[ModuleRecord] = []
+        discarded_zero = 0
         for record in records:
+            if not record.has_combos:
+                discarded_zero += 1
+                continue
             key = self._record_key(record)
             if key in existing_keys:
                 continue
@@ -397,7 +414,12 @@ class ExtractorGUI:
             False,
             f"Added {len(added)} MBN(s); {len(self.records)} total imported.",
         )
-        if len(added) == len(records):
+        if discarded_zero:
+            self.append_log(
+                f"Added {len(added)} candidate RF MBN(s) from {source.name} "
+                f"(discarded {discarded_zero} zero/blank combo MBN(s))."
+            )
+        elif len(added) == len(records):
             self.append_log(
                 f"Added {len(added)} candidate RF MBN(s) from {source.name}."
             )
@@ -654,7 +676,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
         ExtractorGUI().run()
         return 0
     try:
-        records = scan_source(args.source)
+        records = [record for record in scan_source(args.source) if record.has_combos]
         matcher = re.compile(args.match, re.IGNORECASE)
         records = [
             record
