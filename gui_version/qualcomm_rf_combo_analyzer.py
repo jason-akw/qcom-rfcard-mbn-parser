@@ -272,8 +272,20 @@ def _records_from_extraction(result: image_extractor.ScanResult) -> list[ModuleR
             if scratch in mbn_path.parents
             else mbn_path.name
         )
-        # Preserve the legacy ELF /so/ filter for extracted ELF MBNs.
-        if generation == "Legacy ELF" and "/so/" not in inner_rel.casefold():
+        # Numeric MBNs are normally accepted only from Qualcomm's /so tree so
+        # unrelated numeric MCFG files do not become RF-card candidates.
+        # Apple BBCFG extraction places positively identified legacy ELFs in a
+        # dedicated rfcards directory instead.  Normalize separators because
+        # inner_rel is platform-native (notably backslashes on Windows).
+        inner_parts = {
+            part for part in inner_rel.replace("\\", "/").casefold().split("/")
+            if part
+        }
+        if (
+            generation == "Legacy ELF"
+            and "so" not in inner_parts
+            and "rfcards" not in inner_parts
+        ):
             continue
         sidecars = image_extractor.sidecars_in_directory(mbn_path.parent, result.sidecars)
         if sidecars:
@@ -986,23 +998,8 @@ def parse_legacy(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
     components: list[dict[str, Any]] = []
     inference_notes: list[str] = []
 
-    # Prefer the authoritative generated-symbol names exposed by
-    # legacy_rf_parser v3. Older analyzer revisions blindly scanned every
-    # plausible {count, pointer} pair and could confuse a one-record helper/
-    # internal LTE array with the real public LTE CA table.
-    symbols = legacy.read_dynamic_symbols(blob, image)
-    lte_result = legacy.parse_lteca_symbol_table(
-        Path(record.name),
-        blob,
-        image,
-        symbols,
-        record.inner_path,
-    )
-
-    # Retain the structural scanner only for stripped ELFs that have no usable
-    # dynamic symbols.
-    if lte_result is None:
-        lte_result = _parse_legacy_lte_array(record, blob, image)
+    # _find_legacy_lte_array already prefers the authoritative generated
+    # dynamic symbol and falls back to structural scanning for stripped ELFs.
     if lte_result is not None:
         parsed.append(("lte_ca", lte_result))
 

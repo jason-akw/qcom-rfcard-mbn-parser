@@ -10,10 +10,9 @@ gzip/xz/zstd/zip/tar/7z, etc.) and returns the paths of any matching MBNs plus
 co-located sidecar files.
 
 Apple ships the same Qualcomm cards inside a ``.bbfw``/``.ipsw``, where they are
-compressed and content-addressed rather than stored under an ``rf_config_*``
-name.  ``extract_bbcfg`` delegates to ``iphone_rf_parser`` to recover them and
-writes them out under the Android naming convention, so everything downstream -
-discovery, the analyzer, and the GUI - stays unchanged.
+compressed and content-addressed.  ``extract_bbcfg`` delegates to
+``iphone_rf_parser`` to recover both modern ``rf_config_*`` cards and numeric
+legacy ELF cards, so everything downstream can select the matching parser.
 
 All external helpers are optional; missing tools are logged once and skipped.
 """
@@ -36,7 +35,11 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 RFCARD_PATTERN = re.compile(
-    r"^rf_config_[0-9A-Fa-f]{3,6}_[0-9A-Fa-f]{1,4}_[0-9A-Fa-f]{1,4}\.mbn$"
+    r"^(?:"
+    r"rf_config_[0-9A-Fa-f]{3,6}_[0-9A-Fa-f]{1,4}_[0-9A-Fa-f]{1,4}"
+    r"|[0-9A-Fa-f]+_[0-9A-Fa-f]+(?:_[0-9A-Fa-f]+)?"
+    r")\.mbn$",
+    re.IGNORECASE,
 )
 
 # Files that add context around an rf_config MBN (kept when present in the same
@@ -522,8 +525,9 @@ def extract_bbcfg(path: Path, ctx: ExtractContext) -> Path | None:
     Apple stores the RF cards compressed and content-addressed in the tag-0xA9
     blob store, so scanning for EFS pathname tags alone finds ``device_lut``
     and ``device_settings`` but never a card.  ``iphone_rf_parser`` walks that
-    store and writes the cards under Android-style ``rf_config_*.mbn`` names,
-    which is what lets the rest of this module treat them like any other MBN.
+    store and writes modern cards under Android-style ``rf_config_*.mbn`` names
+    and legacy ELFs under numeric legacy names.  This lets the analyzer route
+    each generation to its corresponding parser.
     The EFS pathname scan below still runs afterwards so the EFS tree is
     preserved alongside the cards.
     """

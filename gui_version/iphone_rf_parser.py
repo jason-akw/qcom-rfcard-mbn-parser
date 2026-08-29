@@ -7,7 +7,7 @@ ships the same Qualcomm cards, but stores them **compressed and
 content-addressed** inside the ``bbcfg.mbn`` member of a ``.bbfw``, which is why
 no ``rf_config_*`` or ``*_res.dat`` name appears anywhere in an iPhone firmware.
 
-Container layout (verified on Mav25-1.70.01.Release.bbfw, iPhone18,1 26.6.1):
+Container layout (verified on Mav24/iPhone 16 and Mav25/iPhone 17 firmware):
 
     bbcfg.mbn
       +0x00  u32  0x43464700   'GFC\0'
@@ -25,13 +25,17 @@ Container layout (verified on Mav25-1.70.01.Release.bbfw, iPhone18,1 26.6.1):
 
       'MAVZ' + u32 uncompressed_size + zlib stream
 
-    Payloads that decompress to a Qualcomm MBN ELF containing the Large-EFS
-    item ``/rfc/<HWID>_<FSET>_res.dat`` are the RF cards.
+    Mav25 payloads are Qualcomm MBN ELFs containing the Large-EFS item
+    ``/rfc/<HWID>_<FSET>_res.dat``.  Mav24 and older payloads are the legacy
+    RF-card ELF itself; their generated dynamic symbols begin with
+    ``rfc_hwid<HWID>_``.
 
 Apple's cards carry no BID, so this module synthesises one - the card's ordinal
 within the store - purely so the file can be named the way every downstream
 tool expects.  ``synthetic_bid`` is recorded for every card in the
-``rfcard_info_all.json`` sidecar; HWID and FSET are read from the card itself.
+``rfcard_info_all.json`` sidecar.  Mav24 legacy ELFs also carry no numeric FSET,
+so zero is synthesised for that filename field and the full generated RF-card
+name is retained in the sidecar.
 
 Use from the GUI:
     ``image_extractor.extract_bbcfg`` delegates here, so importing a ``.bbfw``
@@ -58,6 +62,8 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterator
 
+import legacy_rf_parser as legacy
+
 logger = logging.getLogger(__name__)
 
 # The fourcc varies by payload class: '\x00GFC' on bbcfg.mbn, '\x00WOP' on
@@ -72,9 +78,11 @@ PAYLOAD_TAG = "9f65"
 EFS_PATH_TAG = "9f8374"
 EFS_VALUE_TAG = "9f8376"
 MAVZ_MAGIC = b"MAVZ"
+ELF32_MAGIC = b"\x7fELF\x01\x01"
 
 RES_DAT_RE = re.compile(rb"/rfc/(\d+)_(\d+)_res\.dat")
 CMN_DAT_RE = re.compile(rb"/rfc/(\d+)_(\d+)_cmn\.dat")
+LEGACY_RFCARD_RE = re.compile(r"^rfc_hwid(\d+)(?:_|$)", re.IGNORECASE)
 CONTENT_NAME_RE = re.compile(rb"[0-9a-f]{40}")
 BBFW_MEMBER_RE = re.compile(r"\.bbfw$", re.IGNORECASE)
 BBCFG_MEMBER_RE = re.compile(r"(^|/)bbcfg\.mbn$", re.IGNORECASE)
@@ -99,7 +107,10 @@ class RFCard:
     compressed_len: int
     raw_size: int
     sha256: str
-    res_dat: str
+    generation: str
+    rfcard_name: str | None
+    fset_is_synthetic: bool
+    res_dat: str | None
     cmn_dat: str | None
 
     def as_row(self) -> dict:
@@ -236,6 +247,28 @@ def decompress_mavz(blob: bytes, offset: int) -> tuple[bytes, int]:
 # ---------------------------------------------------------------------------
 
 
+def legacy_rfcard_identity(raw: bytes) -> tuple[int, str] | None:
+    """Return ``(HWID, generated name)`` for a legacy RF-card ELF.
+
+    The generated name is a much stronger discriminator than ELF magic alone:
+    BBCFG stores several unrelated executable payloads alongside RF cards.
+    Malformed or unsupported ELFs are simply not RF-card candidates.
+    """
+    if not raw.startswith(ELF32_MAGIC):
+        return None
+    try:
+        image = legacy.Elf32Image(raw)
+        card_name = legacy.rfcard_name_from_symbols(image)
+    except (legacy.ParseError, IndexError, struct.error):
+        return None
+    if card_name is None:
+        return None
+    match = LEGACY_RFCARD_RE.match(card_name)
+    if match is None:
+        return None
+    return int(match.group(1)), card_name
+
+
 def iter_rfcards(blob: bytes) -> Iterator[tuple[RFCard, bytes]]:
     """Yield every RF card in a bbcfg image together with its MBN bytes."""
     ordinal = 0
@@ -248,23 +281,40 @@ def iter_rfcards(blob: bytes) -> Iterator[tuple[RFCard, bytes]]:
             logger.warning("skipping blob %s: %s", name, exc)
             continue
         res = RES_DAT_RE.search(raw)
-        if not res:
-            continue
-        cmn = CMN_DAT_RE.search(raw)
-        hwid, fset = int(res.group(1)), int(res.group(2))
+        cmn = CMN_DAT_RE.search(raw) if res else None
+        if res:
+            hwid, fset = int(res.group(1)), int(res.group(2))
+            filename = f"rf_config_{hwid}_{fset}_{ordinal}.mbn"
+            generation = "DAT/protobuf"
+            rfcard_name = None
+            fset_is_synthetic = False
+        else:
+            legacy_identity = legacy_rfcard_identity(raw)
+            if legacy_identity is None:
+                continue
+            hwid, rfcard_name = legacy_identity
+            fset = 0
+            # A numeric legacy basename makes the analyzer select
+            # legacy_rf_parser; rf_config_* would select DAT/protobuf.
+            filename = f"{hwid}_{fset}_{ordinal}.mbn"
+            generation = "Legacy ELF"
+            fset_is_synthetic = True
         card = RFCard(
             ordinal=ordinal,
             hwid=hwid,
             fset=fset,
             synthetic_bid=ordinal,
-            filename=f"rf_config_{hwid}_{fset}_{ordinal}.mbn",
+            filename=filename,
             bbcfg_offset=payload_off,
             store_index=index,
             content_name=name,
             compressed_len=compressed_len,
             raw_size=len(raw),
             sha256=hashlib.sha256(raw).hexdigest(),
-            res_dat=res.group(0).decode(),
+            generation=generation,
+            rfcard_name=rfcard_name,
+            fset_is_synthetic=fset_is_synthetic,
+            res_dat=res.group(0).decode() if res else None,
             cmn_dat=cmn.group(0).decode() if cmn else None,
         )
         ordinal += 1
@@ -343,6 +393,8 @@ def _write_sidecars(cards: list[RFCard], out_dir: Path, blob: bytes, source: str
                 "container": container_info(blob),
                 "bid_note": ("synthetic_bid is this tool's ordinal, not a value "
                              "read from the firmware; Apple RF cards carry no BID"),
+                "legacy_fset_note": ("fset is synthesised as zero for legacy ELF "
+                                     "cards; use rfcard_name for their full generated identity"),
                 "cards": rows,
             },
             indent=2,
@@ -438,8 +490,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.list:
         cards = [card for card, _ in iter_rfcards(blob)]
         for card in cards:
+            identity = card.res_dat or card.rfcard_name or "unknown"
             print(f"  [{card.ordinal:2d}] {card.filename:28s} "
-                  f"{card.raw_size:>8,} bytes  {card.res_dat}  "
+                  f"{card.raw_size:>8,} bytes  {identity}  "
                   f"bbcfg@0x{card.bbcfg_offset:08x}  {card.content_name[:12]}")
         print(f"{len(cards)} RF card(s)")
         return 0
