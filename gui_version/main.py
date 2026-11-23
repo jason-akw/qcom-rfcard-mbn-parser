@@ -275,13 +275,14 @@ class ExtractorGUI:
             return
 
         filenames = filedialog.askopenfilenames(
-            title="Choose Qualcomm modem images or RF MBNs",
+            title="Choose Qualcomm modem images, RF MBNs, or res DATs",
             filetypes=(
                 (
-                    "Modem images, archives, and MBNs",
-                    "*.img *.bin *.ubi *.mbn *.gz *.xz *.zst *.zip *.tar *.tar.md5 *.tgz *.lz4 *.7z"
+                    "Modem images, archives, MBNs, and res DATs",
+                    "*.img *.bin *.ubi *.mbn *.dat *.gz *.xz *.zst *.zip *.tar *.tar.md5 *.tgz *.lz4 *.7z"
                     " *.bbfw *.ipsw",
                 ),
+                ("RF card DAT files", "*_res.dat"),
                 ("MBN files", "*.mbn"),
                 ("UBI images", "*.ubi"),
                 ("iPhone baseband firmware", "*.bbfw *.ipsw"),
@@ -715,7 +716,8 @@ def build_cli() -> argparse.ArgumentParser:
         "source",
         nargs="?",
         type=Path,
-        help="modem image/UBI container or a directly named RF MBN",
+        help="modem image/UBI container, a directly named RF MBN, "
+        "or a bare *_res.dat RF card",
     )
     parser.add_argument("--list", action="store_true", help="list candidate MBNs")
     parser.add_argument("-o", "--output", type=Path, help="export directory")

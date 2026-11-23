@@ -40,7 +40,7 @@ import new_rfcard_parser as modern
 # the legacy implementation directly.
 ParseError = legacy.ParseError
 
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 MODERN_RE = re.compile(
     r"^rf_config_(?P<hwid>\d+)_(?P<fsid>\d+)_(?P<bid>\d+)"
     r"(?:_(?P<rev>\d+))?\.mbn$",
@@ -49,6 +49,14 @@ MODERN_RE = re.compile(
 LEGACY_RE = re.compile(
     r"^(?P<hwid>[0-9A-F]+)_(?P<fsid>[0-9A-F]+)"
     r"(?:_(?P<bid>[0-9A-F]+))?\.mbn$",
+    re.IGNORECASE,
+)
+# Bare EFS RF-card payload, e.g. 1153_0_res.dat or 1147_0_309_res.dat
+# (<HWID>_<FSID>[_<BID>]_res.dat; accepts the raw EFS/MCFG-wrapped bytes and
+# the stripped hash+len+zlib layout alike, see parse_res_dat candidates).
+RES_DAT_RE = re.compile(
+    r"^(?P<hwid>[0-9A-Za-z]+)_(?P<fsid>[0-9A-Za-z]+)"
+    r"(?:_(?P<bid>[0-9A-Za-z]+))?_res\.dat$",
     re.IGNORECASE,
 )
 TABLE_DISPLAY = {
@@ -76,6 +84,9 @@ class ModuleRecord:
     sha256: str = ""
     lte_combos: int = -1
     nr_combos: str = ""
+    # True when the imported blob *is* a bare /rfc/*_res.dat (EFS or stripped)
+    # rather than an MBN container that embeds one.
+    direct_res_dat: bool = False
 
     @property
     def identity(self) -> str:
@@ -211,6 +222,30 @@ def scan_source(path: Path) -> list[ModuleRecord]:
             path,
         )
 
+    res_match = RES_DAT_RE.fullmatch(path.name)
+    if res_match:
+        # Directly named /rfc/*_res.dat (raw EFS bytes or MCFG-stripped):
+        # parse the protobuf card without looking for an MBN around it.
+        blob = path.read_bytes()
+        digest = hashlib.sha256(blob).hexdigest()
+        common = dict(
+            inner_path=str(path),
+            name=path.name,
+            generation="DAT/protobuf",
+            size=path.stat().st_size,
+            hwid=_identity_value(res_match, "hwid"),
+            fsid=_identity_value(res_match, "fsid"),
+            bid=_identity_value(res_match, "bid"),
+            external=True,
+            source_path=str(path.resolve()),
+            sha256=digest,
+            direct_res_dat=True,
+        )
+        lte, nr = _combo_counts(ModuleRecord(**common), blob)
+        return _deduplicate_records(
+            [ModuleRecord(**common, lte_combos=lte, nr_combos=nr)], path
+        )
+
     try:
         fat = legacy.Fat16Image(path)
     except Exception as exc:
@@ -219,7 +254,8 @@ def scan_source(path: Path) -> list[ModuleRecord]:
             result = image_extractor.scan_container(path)
         except Exception as extract_exc:
             raise ToolError(
-                "Input is neither a named RF MBN nor a supported FAT16 modem image; "
+                "Input is neither a named RF MBN, a *_res.dat RF card, "
+                "nor a supported FAT16 modem image; "
                 f"container extraction also failed: {extract_exc}"
             ) from extract_exc
         return _deduplicate_records(_records_from_extraction(result), path)
@@ -562,20 +598,25 @@ def _modern_nr_rows(
 
 
 def parse_modern(record: ModuleRecord, blob: bytes) -> dict[str, Any]:
-    dats = modern.extract_rfc_dats(blob)
-    res_items = [
-        (name, data)
-        for name, data in dats.items()
-        if name.casefold().endswith("_res.dat")
-    ]
-    if not res_items:
-        raise ToolError("No embedded /rfc/*_res.dat was found")
-    if len(res_items) > 1:
-        raise ToolError(
-            "More than one *_res.dat was found: "
-            + ", ".join(name for name, _ in res_items)
-        )
-    dat_name, res_dat = res_items[0]
+    if getattr(record, "direct_res_dat", False):
+        # Bare *_res.dat import: the blob *is* the res DAT (EFS-wrapped or
+        # MCFG-stripped), so skip the MBN Large-EFS extraction entirely.
+        dat_name, res_dat = record.name, blob
+    else:
+        dats = modern.extract_rfc_dats(blob)
+        res_items = [
+            (name, data)
+            for name, data in dats.items()
+            if name.casefold().endswith("_res.dat")
+        ]
+        if not res_items:
+            raise ToolError("No embedded /rfc/*_res.dat was found")
+        if len(res_items) > 1:
+            raise ToolError(
+                "More than one *_res.dat was found: "
+                + ", ".join(name for name, _ in res_items)
+            )
+        dat_name, res_dat = res_items[0]
     encoding, protobuf_payload, message = modern.parse_res_dat(res_dat)
     card_info = modern.read_rfcard_info(dat_name, record.name, message.rrc)
 
