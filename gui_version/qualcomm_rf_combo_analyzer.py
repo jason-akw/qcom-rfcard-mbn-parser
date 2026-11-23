@@ -40,7 +40,7 @@ import new_rfcard_parser as modern
 # the legacy implementation directly.
 ParseError = legacy.ParseError
 
-VERSION = "1.9.1"
+VERSION = "1.9.2"
 MODERN_RE = re.compile(
     r"^rf_config_(?P<hwid>\d+)_(?P<fsid>\d+)_(?P<bid>\d+)"
     r"(?:_(?P<rev>\d+))?\.mbn$",
@@ -51,12 +51,15 @@ LEGACY_RE = re.compile(
     r"(?:_(?P<bid>[0-9A-F]+))?\.mbn$",
     re.IGNORECASE,
 )
-# Bare EFS RF-card payload, e.g. 1153_0_res.dat or 1147_0_309_res.dat
-# (<HWID>_<FSID>[_<BID>]_res.dat; accepts the raw EFS/MCFG-wrapped bytes and
-# the stripped hash+len+zlib layout alike, see parse_res_dat candidates).
+# Bare EFS RF-card payload, e.g. 1153_0_res.dat, 1147_0_309_res.dat, or a
+# patched working copy such as 1153_0_res_8_3_1_n41_n28_v6.dat
+# (<HWID>_<FSID>[_<BID>]_res[_<suffix>].dat; accepts the raw EFS/MCFG-wrapped
+# bytes and the stripped hash+len+zlib layout alike, see parse_res_dat
+# candidates).
 RES_DAT_RE = re.compile(
     r"^(?P<hwid>[0-9A-Za-z]+)_(?P<fsid>[0-9A-Za-z]+)"
-    r"(?:_(?P<bid>[0-9A-Za-z]+))?_res\.dat$",
+    r"(?:_(?P<bid>[0-9A-Za-z]+))?"
+    r"_res(?:_(?P<suffix>[0-9A-Za-z._-]+))?\.dat$",
     re.IGNORECASE,
 )
 TABLE_DISPLAY = {
