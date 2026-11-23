@@ -489,9 +489,72 @@ def extract_f2fs(path: Path, ctx: ExtractContext) -> Path | None:  # noqa: ARG00
 
 def _safe_output_component(value: object, fallback: str) -> str:
     """Return one filesystem-safe component for UBI image/volume names."""
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", "replace")
     component = Path(str(value)).name
     component = re.sub(r"[^0-9A-Za-z_.-]+", "_", component).strip("._")
     return component or fallback
+
+
+def _dump_ubi_volume(
+    ubi_obj,
+    volume,
+    volume_blocks,
+    volume_name: str,
+    target: Path,
+    peb_size: int,
+) -> Path | None:
+    """Dump a raw (non-UBIFS) UBI volume and keep it if it is a container.
+
+    Quectel modem images commonly wrap a plain squashfs image in a static UBI
+    volume.  ``ubi-reader`` exposes the volume contents as a virtual file; write
+    them out so the normal recursive detection can unwrap squashfs/ext4/etc.
+    """
+    from ubireader.ubi_io import leb_virtual_file
+
+    record = getattr(volume, "vol_rec", None)
+    size = None
+    if record is not None:
+        reserved = getattr(record, "reserved_pebs", 0) or 0
+        data_pad = getattr(record, "data_pad", 0) or 0
+        if reserved:
+            size = max(0, reserved * peb_size - data_pad)
+
+    raw_path = target.parent / f"{target.name}.raw"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    error = None
+    try:
+        with raw_path.open("wb") as handle:
+            for chunk in leb_virtual_file(ubi_obj, volume_blocks).reader():
+                if size is not None:
+                    remaining = size - written
+                    if remaining <= 0:
+                        break
+                    chunk = chunk[:remaining]
+                handle.write(chunk)
+                written += len(chunk)
+    except (Exception, SystemExit) as exc:
+        error = exc
+
+    if error is not None:
+        logger.warning("Could not dump raw UBI volume %r: %s", volume_name, error)
+        raw_path.unlink(missing_ok=True)
+        return None
+
+    tag = detect(raw_path)
+    if tag in EXTRACTORS and tag != "ubi":
+        logger.info(
+            "Dumped raw UBI volume %r (%d bytes) as %s",
+            volume_name,
+            written,
+            tag,
+        )
+        return raw_path
+
+    # Nothing we know how to unwrap: discard the dump to keep scratch clean.
+    raw_path.unlink(missing_ok=True)
+    return None
 
 
 def _extract_ubi_with_python(path: Path, out: Path) -> bool:
@@ -540,25 +603,40 @@ def _extract_ubi_with_python(path: Path, out: Path) -> bool:
                     ubifs_obj = ubifs(leb_file)
                     extract_files(ubifs_obj, str(target), False)
                 except (Exception, SystemExit) as exc:
-                    # A UBI image may mix UBIFS and raw/static volumes.  Keep
-                    # scanning other volumes when one is not a filesystem.
+                    # A UBI image may mix UBIFS and raw/static volumes (e.g. a
+                    # Quectel squashfs volume).  Dump raw volumes so the normal
+                    # recursive detection can unwrap their contents.
                     logger.warning(
-                        "Skipping non-UBIFS or unreadable UBI volume %r: %s",
+                        "UBI volume %r is not UBIFS (%s); trying raw dump",
                         volume_name,
                         exc,
                     )
+                    if target.exists():
+                        try:
+                            target.rmdir()  # only removes it when still empty
+                        except OSError:
+                            pass
+                    if _dump_ubi_volume(
+                        ubi_obj,
+                        volume,
+                        volume_blocks,
+                        volume_name,
+                        target,
+                        peb_size,
+                    ):
+                        extracted_volumes += 1
                     continue
                 if any(target.rglob("*")):
                     extracted_volumes += 1
 
         if extracted_volumes:
             logger.info(
-                "Extracted %d UBIFS volume(s) from %s",
+                "Extracted %d UBI volume(s) from %s",
                 extracted_volumes,
                 path.name,
             )
             return True
-        logger.warning("ubi-reader found no extractable UBIFS volumes in %s", path)
+        logger.warning("ubi-reader found no extractable UBI volumes in %s", path)
     except (Exception, SystemExit) as exc:  # ubi-reader uses SystemExit for fatal parse errors
         logger.warning("Python ubi-reader failed on %s: %s", path, exc)
     finally:
